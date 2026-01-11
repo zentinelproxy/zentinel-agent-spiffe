@@ -1,0 +1,136 @@
+// SPIFFE Workload API Protocol Buffer definitions
+// Based on https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE_Workload_API.md
+
+syntax = "proto3";
+
+package spiffe.workload;
+
+option go_package = "github.com/spiffe/go-spiffe/v2/proto/spiffe/workload";
+
+// The SpiffeWorkloadAPI service provides workload identity services.
+service SpiffeWorkloadAPI {
+    // Fetch X.509 SVIDs for all registration entries with which the
+    // workload is entitled.
+    rpc FetchX509SVID(X509SVIDRequest) returns (stream X509SVIDResponse);
+
+    // Fetch trust bundles and CRLs. Callers may request for a specific set
+    // of bundles. If unspecified, all bundles known by the Spire Agent
+    // that the workload is entitled to are returned.
+    rpc FetchX509Bundles(X509BundlesRequest) returns (stream X509BundlesResponse);
+
+    // Fetch JWT SVIDs for all registration entries with which the workload
+    // is entitled. TTL is optional. If not specified, the default value
+    // (from the SVID) is used.
+    rpc FetchJWTSVID(JWTSVIDRequest) returns (JWTSVIDResponse);
+
+    // Fetch JWT bundles.
+    rpc FetchJWTBundles(JWTBundlesRequest) returns (stream JWTBundlesResponse);
+
+    // Validates a JWT SVID against the trust bundle.
+    rpc ValidateJWTSVID(ValidateJWTSVIDRequest) returns (ValidateJWTSVIDResponse);
+}
+
+// X509SVIDRequest is the request message for FetchX509SVID.
+message X509SVIDRequest {
+}
+
+// X509SVIDResponse is the response message for FetchX509SVID.
+message X509SVIDResponse {
+    // X.509 SVIDs. The first SVID in the list is the default SVID.
+    repeated X509SVID svids = 1;
+
+    // ASN.1 DER encoded X.509 certificate for the federated trust domains
+    // this workload has been federated with.
+    // Keyed by trust domain name.
+    map<string, bytes> federated_bundles = 2;
+}
+
+// X509SVID represents an X.509 SVID.
+message X509SVID {
+    // The SPIFFE ID of the SVID in the URI form.
+    string spiffe_id = 1;
+
+    // ASN.1 DER encoded X.509 certificate chain. The first certificate
+    // in the chain is the X.509 SVID.
+    bytes x509_svid = 2;
+
+    // ASN.1 DER encoded PKCS#8 private key. The algorithm depends on the
+    // key type (e.g., RSA, ECDSA).
+    bytes x509_svid_key = 3;
+
+    // ASN.1 DER encoded X.509 bundle for the trust domain.
+    bytes bundle = 4;
+
+    // Optional. Hint provides a hint about how the SVID should be used.
+    string hint = 5;
+}
+
+// X509BundlesRequest is the request message for FetchX509Bundles.
+message X509BundlesRequest {
+}
+
+// X509BundlesResponse is the response message for FetchX509Bundles.
+message X509BundlesResponse {
+    // ASN.1 DER encoded X.509 bundles keyed by trust domain.
+    map<string, bytes> bundles = 1;
+}
+
+// JWTSVIDRequest is the request message for FetchJWTSVID.
+message JWTSVIDRequest {
+    // Required. The audience(s) the SVID is intended for.
+    repeated string audience = 1;
+
+    // Optional. The SPIFFE ID to mint the SVID for. If unspecified, the
+    // workload is minted an SVID for each registration entry it is
+    // entitled to.
+    string spiffe_id = 2;
+}
+
+// JWTSVIDResponse is the response message for FetchJWTSVID.
+message JWTSVIDResponse {
+    // JWT SVIDs
+    repeated JWTSVID svids = 1;
+}
+
+// JWTSVID represents a JWT SVID.
+message JWTSVID {
+    // The SPIFFE ID of the SVID in the URI form.
+    string spiffe_id = 1;
+
+    // Encoded JWT token.
+    string svid = 2;
+
+    // Optional. Hint provides a hint about how the SVID should be used.
+    string hint = 3;
+}
+
+// JWTBundlesRequest is the request message for FetchJWTBundles.
+message JWTBundlesRequest {
+}
+
+// JWTBundlesResponse is the response message for FetchJWTBundles.
+message JWTBundlesResponse {
+    // JWK sets keyed by trust domain.
+    map<string, bytes> bundles = 1;
+}
+
+// ValidateJWTSVIDRequest is the request message for ValidateJWTSVID.
+message ValidateJWTSVIDRequest {
+    // Required. The audience to validate against.
+    string audience = 1;
+
+    // Required. The JWT SVID to validate.
+    string svid = 2;
+}
+
+// ValidateJWTSVIDResponse is the response message for ValidateJWTSVID.
+message ValidateJWTSVIDResponse {
+    // Required. The SPIFFE ID of the SVID.
+    string spiffe_id = 1;
+
+    // Required. Claims from the JWT SVID.
+    google.protobuf.Struct claims = 2;
+}
+
+// Import google.protobuf.Struct
+import "google/protobuf/struct.proto";
