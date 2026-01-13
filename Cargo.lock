@@ -1678,7 +1678,9 @@ dependencies = [
 
 [[package]]
 name = "sentinel-agent-protocol"
-version = "0.2.5"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1075a70bfde40974fb741f4c710966f4fbf0dfd8048cd6b333f0be163bf5a0dd"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1736,7 +1738,9 @@ dependencies = [
 
 [[package]]
 name = "sentinel-common"
-version = "0.2.5"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6022a3354a57c3cef49cbb871f2fd6ec4b86c0288e9eb0de3389b44e493f5da2"
 dependencies = [
  "anyhow",
  "chrono",
