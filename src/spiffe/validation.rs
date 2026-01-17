@@ -75,6 +75,7 @@ impl ValidationResult {
     }
 
     /// Create a failed validation result.
+    #[allow(dead_code)]
     pub fn failure(error: impl Into<String>) -> Self {
         Self {
             valid: false,
@@ -88,6 +89,7 @@ impl ValidationResult {
 }
 
 /// Information extracted from a certificate.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CertificateInfo {
     /// Certificate serial number (hex).
@@ -349,6 +351,7 @@ mod tests {
     use super::*;
 
     // Test certificate data (self-signed for testing)
+    #[allow(dead_code)]
     const TEST_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
 MIIBkTCB+wIJAKHBfpEgcMFvMAoGCCqGSM49BAMCMBExDzANBgNVBAMMBnRlc3Rj
 YTAeFw0yNDAxMDEwMDAwMDBaFw0yNTAxMDEwMDAwMDBaMBMxETAPBgNVBAMMCHRl

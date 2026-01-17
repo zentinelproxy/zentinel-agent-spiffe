@@ -8,8 +8,5 @@
 mod validation;
 mod workload_api;
 
-pub use validation::{
-    extract_spiffe_id_from_cert, validate_certificate, CertificateInfo, ValidationError,
-    ValidationResult,
-};
-pub use workload_api::{TrustBundle, TrustBundleCache, WorkloadApiClient, WorkloadApiError};
+pub use validation::{validate_certificate, ValidationResult};
+pub use workload_api::{TrustBundleCache, WorkloadApiClient};

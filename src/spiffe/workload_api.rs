@@ -20,6 +20,7 @@ pub mod proto {
 }
 
 /// Errors that can occur when interacting with the SPIRE Workload API.
+#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum WorkloadApiError {
     #[error("failed to connect to SPIRE agent: {0}")]
@@ -42,6 +43,7 @@ pub enum WorkloadApiError {
 }
 
 /// Trust bundle for a trust domain.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TrustBundle {
     /// Trust domain name.
@@ -53,6 +55,7 @@ pub struct TrustBundle {
 }
 
 /// Cache for trust bundles.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct TrustBundleCache {
     /// Bundles keyed by trust domain.
@@ -61,6 +64,7 @@ pub struct TrustBundleCache {
     ttl_secs: u64,
 }
 
+#[allow(dead_code)]
 impl TrustBundleCache {
     /// Create a new trust bundle cache.
     pub fn new(ttl_secs: u64) -> Self {
@@ -133,6 +137,7 @@ impl TrustBundleCache {
 ///
 /// SPIRE returns trust bundles as a single blob containing multiple DER certificates
 /// concatenated together. This function splits them into individual certs.
+#[allow(dead_code)]
 fn parse_der_certificates(data: &[u8]) -> Vec<Vec<u8>> {
     let mut certs = Vec::new();
     let mut offset = 0;
@@ -149,14 +154,14 @@ fn parse_der_certificates(data: &[u8]) -> Vec<Vec<u8>> {
                 // Short form: length is directly encoded
                 (b as usize, 2)
             }
-            Some(&b) if b == 0x81 => {
+            Some(&0x81) => {
                 // Long form: 1 byte length
                 match data.get(offset + 2) {
                     Some(&len_byte) => (len_byte as usize, 3),
                     None => break,
                 }
             }
-            Some(&b) if b == 0x82 => {
+            Some(&0x82) => {
                 // Long form: 2 byte length
                 match (data.get(offset + 2), data.get(offset + 3)) {
                     (Some(&hi), Some(&lo)) => (((hi as usize) << 8) | (lo as usize), 4),
@@ -192,6 +197,7 @@ pub struct WorkloadApiClient {
     timeout_ms: u64,
 }
 
+#[allow(dead_code)]
 impl WorkloadApiClient {
     /// Create a new Workload API client.
     pub fn new(socket_path: PathBuf, bundle_refresh_secs: u64, timeout_ms: u64) -> Self {
@@ -362,12 +368,14 @@ impl WorkloadApiClient {
 }
 
 /// Builder for WorkloadApiClient.
+#[allow(dead_code)]
 pub struct WorkloadApiClientBuilder {
     socket_path: PathBuf,
     bundle_refresh_secs: u64,
     timeout_ms: u64,
 }
 
+#[allow(dead_code)]
 impl WorkloadApiClientBuilder {
     /// Create a new builder with default values.
     pub fn new() -> Self {

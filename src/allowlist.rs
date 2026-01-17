@@ -237,6 +237,7 @@ pub fn extract_workload_path(spiffe_id: &str) -> Option<&str> {
 }
 
 /// Parse a SPIFFE ID into its components.
+#[allow(dead_code)]
 pub fn parse_spiffe_id(spiffe_id: &str) -> Option<SpiffeIdComponents<'_>> {
     let remainder = spiffe_id.strip_prefix("spiffe://")?;
 
@@ -253,6 +254,7 @@ pub fn parse_spiffe_id(spiffe_id: &str) -> Option<SpiffeIdComponents<'_>> {
 }
 
 /// Components of a parsed SPIFFE ID.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SpiffeIdComponents<'a> {
     /// The full SPIFFE ID.
