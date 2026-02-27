@@ -131,7 +131,10 @@ pub fn decode_certificate(header_value: &str) -> Result<Vec<u8>, ValidationError
         trace!("Decoding raw PEM certificate");
         // Replace spaces that might be newlines
         let pem_str = header_value
-            .replace("-----BEGIN CERTIFICATE----- ", "-----BEGIN CERTIFICATE-----\n")
+            .replace(
+                "-----BEGIN CERTIFICATE----- ",
+                "-----BEGIN CERTIFICATE-----\n",
+            )
             .replace(" -----END CERTIFICATE-----", "\n-----END CERTIFICATE-----");
         return parse_pem_to_der(&pem_str);
     }
@@ -299,8 +302,9 @@ fn verify_certificate_signature(cert_der: &[u8], ca_der: &[u8]) -> Result<(), Va
         .map_err(|e| ValidationError::ParseFailed(format!("CA parse failed: {}", e)))?;
 
     // Verify the certificate was signed by the CA
-    cert.verify_signature(Some(ca.public_key()))
-        .map_err(|e| ValidationError::ChainVerificationFailed(format!("Signature verification failed: {:?}", e)))
+    cert.verify_signature(Some(ca.public_key())).map_err(|e| {
+        ValidationError::ChainVerificationFailed(format!("Signature verification failed: {:?}", e))
+    })
 }
 
 /// Extract additional claims from the certificate.
@@ -396,7 +400,10 @@ aiAiEAtest56789=
         );
 
         assert!(result.valid);
-        assert_eq!(result.spiffe_id, Some("spiffe://example.org/app".to_string()));
+        assert_eq!(
+            result.spiffe_id,
+            Some("spiffe://example.org/app".to_string())
+        );
         assert!(result.error.is_none());
     }
 

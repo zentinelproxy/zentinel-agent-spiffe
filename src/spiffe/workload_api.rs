@@ -105,10 +105,7 @@ impl TrustBundleCache {
             );
         }
 
-        debug!(
-            bundle_count = bundles.len(),
-            "Updated trust bundle cache"
-        );
+        debug!(bundle_count = bundles.len(), "Updated trust bundle cache");
     }
 
     /// Check if the cache needs refresh.
@@ -192,7 +189,8 @@ pub struct WorkloadApiClient {
     /// Trust bundle cache.
     bundle_cache: Arc<TrustBundleCache>,
     /// gRPC client (when connected).
-    grpc_client: RwLock<Option<proto::spiffe_workload_api_client::SpiffeWorkloadApiClient<Channel>>>,
+    grpc_client:
+        RwLock<Option<proto::spiffe_workload_api_client::SpiffeWorkloadApiClient<Channel>>>,
     /// API call timeout in milliseconds.
     timeout_ms: u64,
 }
@@ -249,9 +247,9 @@ impl WorkloadApiClient {
             .connect_with_connector(service_fn(move |_: Uri| {
                 let path = socket_path.clone();
                 async move {
-                    UnixStream::connect(path).await.map(|stream| {
-                        hyper_util::rt::TokioIo::new(stream)
-                    })
+                    UnixStream::connect(path)
+                        .await
+                        .map(hyper_util::rt::TokioIo::new)
                 }
             }))
             .await
@@ -275,8 +273,9 @@ impl WorkloadApiClient {
     }
 
     /// Fetch trust bundles from SPIRE agent via the FetchX509Bundles gRPC call.
-    pub async fn fetch_trust_bundles(&self) -> Result<HashMap<String, Vec<Vec<u8>>>, WorkloadApiError>
-    {
+    pub async fn fetch_trust_bundles(
+        &self,
+    ) -> Result<HashMap<String, Vec<Vec<u8>>>, WorkloadApiError> {
         let mut client = {
             let guard = self.grpc_client.read().await;
             match guard.as_ref() {
@@ -305,7 +304,9 @@ impl WorkloadApiClient {
             .message()
             .await
             .map_err(|e| WorkloadApiError::AgentError(e.message().to_string()))?
-            .ok_or_else(|| WorkloadApiError::AgentError("Empty response from SPIRE agent".to_string()))?;
+            .ok_or_else(|| {
+                WorkloadApiError::AgentError("Empty response from SPIRE agent".to_string())
+            })?;
 
         // Parse the bundles - each bundle is a concatenation of DER-encoded certificates
         let mut bundles = HashMap::new();
@@ -456,11 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_socket_not_found() {
-        let client = WorkloadApiClient::new(
-            PathBuf::from("/nonexistent/socket.sock"),
-            300,
-            5000,
-        );
+        let client = WorkloadApiClient::new(PathBuf::from("/nonexistent/socket.sock"), 300, 5000);
 
         let result = client.connect().await;
         assert!(matches!(result, Err(WorkloadApiError::SocketNotFound(_))));

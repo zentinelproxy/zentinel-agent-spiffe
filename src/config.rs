@@ -301,10 +301,7 @@ mod tests {
             PathBuf::from("/run/spire/sockets/agent.sock")
         );
         assert_eq!(config.spire.bundle_refresh_interval, 300);
-        assert_eq!(
-            config.tls.client_cert_header,
-            "X-Forwarded-Client-Cert"
-        );
+        assert_eq!(config.tls.client_cert_header, "X-Forwarded-Client-Cert");
         assert!(!config.tls.require_mtls);
         assert_eq!(config.failure.spire_unavailable, FailureMode::FailClosed);
     }
@@ -339,10 +336,7 @@ mod tests {
             config.allowlist.exact,
             vec!["spiffe://example.org/frontend"]
         );
-        assert_eq!(
-            config.allowlist.trust_domains,
-            vec!["example.org"]
-        );
+        assert_eq!(config.allowlist.trust_domains, vec!["example.org"]);
         assert_eq!(config.failure.spire_unavailable, FailureMode::FailOpen);
     }
 

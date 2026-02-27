@@ -38,9 +38,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use zentinel_agent_protocol::v2::{
-    AgentCapabilities, AgentFeatures, AgentHandlerV2, AgentLimits, DrainReason,
-    GrpcAgentServerV2, HealthConfig, HealthStatus, MetricsReport, ShutdownReason,
-    UdsAgentServerV2,
+    AgentCapabilities, AgentFeatures, AgentHandlerV2, AgentLimits, DrainReason, GrpcAgentServerV2,
+    HealthConfig, HealthStatus, MetricsReport, ShutdownReason, UdsAgentServerV2,
 };
 use zentinel_agent_protocol::{
     AgentResponse, AuditMetadata, EventType, HeaderOp, RequestHeadersEvent,
@@ -64,7 +63,11 @@ fn now_ms() -> u64 {
 #[command(about = "SPIFFE/SPIRE workload identity agent for Zentinel reverse proxy")]
 struct Args {
     /// Path to Unix socket (UDS mode)
-    #[arg(long, default_value = "/tmp/zentinel-spiffe.sock", env = "AGENT_SOCKET")]
+    #[arg(
+        long,
+        default_value = "/tmp/zentinel-spiffe.sock",
+        env = "AGENT_SOCKET"
+    )]
     socket: PathBuf,
 
     /// gRPC address to listen on (gRPC mode). If specified, UDS mode is disabled.
@@ -152,10 +155,7 @@ impl SpiffeAgent {
     }
 
     /// Get a header value from the headers map (case-insensitive).
-    fn get_header<'a>(
-        headers: &'a HashMap<String, Vec<String>>,
-        name: &str,
-    ) -> Option<&'a str> {
+    fn get_header<'a>(headers: &'a HashMap<String, Vec<String>>, name: &str) -> Option<&'a str> {
         let name_lower = name.to_lowercase();
         headers
             .iter()
@@ -225,14 +225,8 @@ impl SpiffeAgent {
 
         // Build audit metadata
         let mut custom = HashMap::new();
-        custom.insert(
-            "spiffe_id".to_string(),
-            serde_json::json!(spiffe_id),
-        );
-        custom.insert(
-            "trust_domain".to_string(),
-            serde_json::json!(trust_domain),
-        );
+        custom.insert("spiffe_id".to_string(), serde_json::json!(spiffe_id));
+        custom.insert("trust_domain".to_string(), serde_json::json!(trust_domain));
         if let Some(ref match_type) = allowlist_match.match_type {
             custom.insert(
                 "match_type".to_string(),
@@ -240,10 +234,7 @@ impl SpiffeAgent {
             );
         }
         if let Some(ref pattern) = allowlist_match.pattern {
-            custom.insert(
-                "match_pattern".to_string(),
-                serde_json::json!(pattern),
-            );
+            custom.insert("match_pattern".to_string(), serde_json::json!(pattern));
         }
         if let Some(ref cert_info) = validation.cert_info {
             custom.insert(
@@ -381,10 +372,9 @@ impl AgentHandlerV2 for SpiffeAgent {
 
         let mut report = MetricsReport::new("zentinel-spiffe-agent", 10_000);
 
-        report.counters.push(CounterMetric::new(
-            "spiffe_agent_requests_total",
-            processed,
-        ));
+        report
+            .counters
+            .push(CounterMetric::new("spiffe_agent_requests_total", processed));
         report.counters.push(CounterMetric::new(
             "spiffe_agent_requests_allowed_total",
             allowed,
@@ -467,14 +457,10 @@ impl AgentHandlerV2 for SpiffeAgent {
                 debug!(error = %error_msg, "Certificate validation failed");
 
                 return match config.failure.validation_failure {
-                    ValidationFailureAction::Reject => {
-                        match config.failure.spire_unavailable {
-                            FailureMode::FailOpen => {
-                                self.build_fail_open_response(&error_msg)
-                            }
-                            _ => self.build_unauthorized_response(&error_msg, 401),
-                        }
-                    }
+                    ValidationFailureAction::Reject => match config.failure.spire_unavailable {
+                        FailureMode::FailOpen => self.build_fail_open_response(&error_msg),
+                        _ => self.build_unauthorized_response(&error_msg, 401),
+                    },
                     ValidationFailureAction::LogAndAllow => {
                         warn!(error = %error_msg, "Certificate validation failed, log-and-allow enabled");
                         AgentResponse::default_allow().with_audit(AuditMetadata {
@@ -524,10 +510,8 @@ impl AgentHandlerV2 for SpiffeAgent {
                 spiffe_id = %spiffe_id,
                 "SPIFFE ID not in allowlist"
             );
-            return self.build_unauthorized_response(
-                &format!("SPIFFE ID {} not allowed", spiffe_id),
-                403,
-            );
+            return self
+                .build_unauthorized_response(&format!("SPIFFE ID {} not allowed", spiffe_id), 403);
         }
 
         // Log successful authentication
@@ -589,7 +573,10 @@ async fn main() -> Result<()> {
             "Starting gRPC agent server (v2 protocol)"
         );
         let server = GrpcAgentServerV2::new("zentinel-spiffe-agent", Box::new(agent));
-        server.run(grpc_addr).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+        server
+            .run(grpc_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
     } else {
         // UDS mode (default)
         info!(socket = ?args.socket, "Starting UDS agent server");
@@ -673,7 +660,11 @@ mod tests {
         // Verify new allowlist is active
         let allowlist = agent.allowlist.read().await;
         assert!(allowlist.is_allowed("spiffe://other.org/backend").allowed);
-        assert!(!allowlist.is_allowed("spiffe://example.org/frontend").allowed);
+        assert!(
+            !allowlist
+                .is_allowed("spiffe://example.org/frontend")
+                .allowed
+        );
     }
 
     #[test]
@@ -733,7 +724,8 @@ mod tests {
             }
         });
 
-        let result = AgentHandlerV2::on_configure(&agent, new_config, Some("v1.0.0".to_string())).await;
+        let result =
+            AgentHandlerV2::on_configure(&agent, new_config, Some("v1.0.0".to_string())).await;
         assert!(result);
 
         // Verify config version was stored
