@@ -26,9 +26,9 @@ tokio = { version = "1.40", features = ["full", "net"] }
 async-trait = "0.1"
 
 # gRPC for SPIRE Workload API
-tonic = { version = "0.12", features = ["tls", "transport"] }
-prost = "0.13"
-prost-types = "0.13"
+tonic = { version = "0.14", features = ["tls", "transport"] }
+prost = "0.14"
+prost-types = "0.14"
 tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 
@@ -65,7 +65,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 http = "1.1"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.14"
 
 [dev-dependencies]
 tempfile = "3.12"
