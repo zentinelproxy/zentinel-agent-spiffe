@@ -27,6 +27,7 @@ async-trait = "0.1"
 
 # gRPC for SPIRE Workload API
 tonic = { version = "0.14", features = ["tls-ring", "transport"] }
+tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 tower = "0.5"
