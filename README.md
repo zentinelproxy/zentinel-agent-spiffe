@@ -14,12 +14,31 @@ zentinel bundle install spiffe
 zentinel bundle install
 ```
 
-The bundle command downloads the correct binary for your platform and places it in the standard location. See the [bundle documentation](https://zentinelproxy.io/docs/deployment/bundle/) for details.
+The bundle command downloads the correct binary for your platform and places it in the standard location. See the [bundle documentation](https://docs.zentinelproxy.io/deployment/bundle/) for details.
 
 ### Using Cargo
 
+`zentinel-agent-spiffe` is not published on crates.io, so `cargo install zentinel-agent-spiffe` does not
+work. Install straight from the repository instead:
+
 ```bash
-cargo install zentinel-agent-spiffe
+cargo install --git https://github.com/zentinelproxy/zentinel-agent-spiffe
+```
+
+This builds and installs the `zentinel-spiffe-agent` binary.
+
+### Prebuilt Binaries
+
+Each [release](https://github.com/zentinelproxy/zentinel-agent-spiffe/releases) ships binaries
+for `linux-x86_64`, `linux-aarch64`, and `darwin-aarch64`:
+
+```bash
+VERSION=0.3.0
+PLATFORM=linux-x86_64   # or linux-aarch64, darwin-aarch64
+curl -fsSL -o zentinel-spiffe-agent.tar.gz \
+  "https://github.com/zentinelproxy/zentinel-agent-spiffe/releases/download/v${VERSION}/zentinel-spiffe-agent-${VERSION}-${PLATFORM}.tar.gz"
+tar -xzf zentinel-spiffe-agent.tar.gz
+sudo install -m 0755 zentinel-spiffe-agent /usr/local/bin/
 ```
 
 ### From Source
@@ -32,7 +51,7 @@ cargo build --release
 
 ## Documentation
 
-See [zentinelproxy.io/docs/agents/spiffe](https://zentinelproxy.io/docs/agents/spiffe)
+See [zentinelproxy.io/docs/agents/spiffe](https://docs.zentinelproxy.io/agents/spiffe)
 
 ## License
 
