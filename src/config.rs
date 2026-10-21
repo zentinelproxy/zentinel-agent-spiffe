@@ -32,6 +32,49 @@ pub struct SpiffeAgentConfig {
     pub audit: AuditConfig,
 }
 
+impl SpiffeAgentConfig {
+    /// Reject configurations this agent cannot enforce safely.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tls.trust_forwarded_client_cert {
+            return Err(format!(
+                "tls.trust-forwarded-client-cert is set, but this agent cannot verify a \
+                 forwarded client certificate against the SPIRE trust bundle (trust bundles \
+                 are never fetched and only a single signature is checked), so `{}` would be \
+                 client-controlled identity; refusing the configuration \
+                 (zentinelproxy/zentinel-agent-spiffe#5)",
+                self.tls.client_cert_header
+            ));
+        }
+        Ok(())
+    }
+
+    /// Names of every identity header this agent emits, plus the default
+    /// names, deduplicated case-insensitively. These are removed from every
+    /// request the agent allows so a client cannot supply them itself.
+    pub fn identity_header_names(&self) -> Vec<String> {
+        let defaults = HeadersConfig::default();
+        let candidates = [
+            &self.headers.spiffe_id,
+            &self.headers.trust_domain,
+            &self.headers.workload_id,
+            &self.headers.auth_method,
+            &self.headers.auth_timestamp,
+            &defaults.spiffe_id,
+            &defaults.trust_domain,
+            &defaults.workload_id,
+            &defaults.auth_method,
+            &defaults.auth_timestamp,
+        ];
+        let mut names: Vec<String> = Vec::new();
+        for name in candidates {
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+}
+
 /// SPIRE Workload API configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -89,8 +132,23 @@ pub struct TlsConfig {
     pub client_cert_header: String,
 
     /// Require mTLS for all requests.
+    ///
+    /// With no verifiable identity source every request is denied while this
+    /// is set; it never falls back to allowing the request.
     #[serde(default)]
     pub require_mtls: bool,
+
+    /// Treat `client-cert-header` as the client's identity.
+    ///
+    /// Zentinel does not set that header, so unless a trusted TLS-terminating
+    /// proxy in front of Zentinel sets it (and strips any client-supplied
+    /// copy), its value is chosen by the client. Defaults to `false`. Opting in
+    /// also requires verifying the certificate chain against the SPIRE trust
+    /// bundle, which this agent does not implement yet, so a configuration
+    /// that sets this to `true` is rejected (see
+    /// zentinelproxy/zentinel-agent-spiffe#5).
+    #[serde(default)]
+    pub trust_forwarded_client_cert: bool,
 }
 
 impl Default for TlsConfig {
@@ -98,6 +156,7 @@ impl Default for TlsConfig {
         Self {
             client_cert_header: default_client_cert_header(),
             require_mtls: false,
+            trust_forwarded_client_cert: false,
         }
     }
 }
@@ -303,6 +362,8 @@ mod tests {
         assert_eq!(config.spire.bundle_refresh_interval, 300);
         assert_eq!(config.tls.client_cert_header, "X-Forwarded-Client-Cert");
         assert!(!config.tls.require_mtls);
+        assert!(!config.tls.trust_forwarded_client_cert);
+        assert!(config.validate().is_ok());
         assert_eq!(config.failure.spire_unavailable, FailureMode::FailClosed);
     }
 
@@ -350,5 +411,34 @@ mod tests {
             ..Default::default()
         };
         assert!(!config_with_exact.is_empty());
+    }
+
+    #[test]
+    fn test_trust_forwarded_client_cert_opt_in_rejected() {
+        let json = r#"{ "tls": { "require-mtls": true, "trust-forwarded-client-cert": true } }"#;
+        let config: SpiffeAgentConfig = serde_json::from_str(json).unwrap();
+        assert!(config.tls.trust_forwarded_client_cert);
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("zentinel-agent-spiffe#5"), "{err}");
+        assert!(err.contains("trust-forwarded-client-cert"), "{err}");
+    }
+
+    #[test]
+    fn test_identity_header_names_include_configured_and_defaults() {
+        let mut config = SpiffeAgentConfig::default();
+        config.headers.spiffe_id = "X-Workload-Identity".to_string();
+        config.headers.auth_method = "x-auth-method".to_string();
+        let names = config.identity_header_names();
+        assert!(names.contains(&"X-Workload-Identity".to_string()));
+        assert!(names.contains(&"X-SPIFFE-Id".to_string()));
+        assert!(names.contains(&"X-SPIFFE-Workload-Id".to_string()));
+        // Case-insensitive duplicates collapse to one entry.
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.eq_ignore_ascii_case("x-auth-method"))
+                .count(),
+            1
+        );
     }
 }

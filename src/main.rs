@@ -112,6 +112,8 @@ pub struct SpiffeAgent {
 impl SpiffeAgent {
     /// Create a new SPIFFE agent.
     pub fn new(config: SpiffeAgentConfig) -> Result<Self> {
+        config.validate().map_err(|e| anyhow!(e))?;
+
         // Create allowlist from config
         let allowlist = SpiffeIdAllowlist::new(&config.allowlist)
             .map_err(|e| anyhow!("Failed to create allowlist: {}", e))?;
@@ -140,6 +142,8 @@ impl SpiffeAgent {
 
     /// Reconfigure the agent with new settings.
     pub async fn reconfigure(&self, new_config: SpiffeAgentConfig) -> Result<()> {
+        new_config.validate().map_err(|e| anyhow!(e))?;
+
         // Create new allowlist
         let new_allowlist = SpiffeIdAllowlist::new(&new_config.allowlist)
             .map_err(|e| anyhow!("Failed to create allowlist: {}", e))?;
@@ -162,6 +166,24 @@ impl SpiffeAgent {
             .find(|(k, _)| k.to_lowercase() == name_lower)
             .and_then(|(_, v)| v.first())
             .map(|s| s.as_str())
+    }
+
+    /// Remove every identity header this agent emits from the upstream
+    /// request, so a client cannot supply them itself. Applied to every
+    /// response that lets the request through, before any identity is set.
+    fn strip_identity_headers(
+        mut response: AgentResponse,
+        config: &SpiffeAgentConfig,
+    ) -> AgentResponse {
+        for name in config.identity_header_names() {
+            response = response.add_request_header(HeaderOp::Remove { name });
+        }
+        response
+    }
+
+    /// Allow the request without an identity (identity headers stripped).
+    fn build_anonymous_allow(config: &SpiffeAgentConfig) -> AgentResponse {
+        Self::strip_identity_headers(AgentResponse::default_allow(), config)
     }
 
     /// Build an unauthorized response.
@@ -197,7 +219,7 @@ impl SpiffeAgent {
         let spiffe_id = validation.spiffe_id.as_ref().unwrap();
         let trust_domain = validation.trust_domain.as_ref().unwrap();
 
-        let mut response = AgentResponse::default_allow()
+        let mut response = Self::build_anonymous_allow(config)
             .add_request_header(HeaderOp::Set {
                 name: config.headers.spiffe_id.clone(),
                 value: spiffe_id.clone(),
@@ -253,10 +275,10 @@ impl SpiffeAgent {
     }
 
     /// Handle fail-open scenario.
-    fn build_fail_open_response(&self, reason: &str) -> AgentResponse {
+    fn build_fail_open_response(&self, reason: &str, config: &SpiffeAgentConfig) -> AgentResponse {
         warn!(reason = %reason, "SPIFFE authentication failed, fail-open enabled");
 
-        AgentResponse::default_allow().with_audit(AuditMetadata {
+        Self::build_anonymous_allow(config).with_audit(AuditMetadata {
             tags: vec!["spiffe".to_string(), "fail_open".to_string()],
             reason_codes: vec!["SPIFFE_FAIL_OPEN".to_string()],
             custom: HashMap::from([("reason".to_string(), serde_json::json!(reason))]),
@@ -424,33 +446,41 @@ impl AgentHandlerV2 for SpiffeAgent {
         self.requests_processed.fetch_add(1, Ordering::Relaxed);
         let config = self.config.read().await;
 
+        // Zentinel does not tell agents which peer certificate it verified, and
+        // it never sets the client-certificate header itself, so that header is
+        // client-controlled unless a trusted front proxy sets it. Without the
+        // explicit opt-in there is no verifiable identity source at all.
+        if !config.tls.trust_forwarded_client_cert {
+            if config.tls.require_mtls {
+                debug!("No verifiable client identity source, mTLS required");
+                return self.build_unauthorized_response(
+                    "No verifiable client identity (the client certificate header is not trusted)",
+                    401,
+                );
+            }
+            return Self::build_anonymous_allow(&config);
+        }
+
         // Get client certificate from header
         let cert_header = match Self::get_header(&event.headers, &config.tls.client_cert_header) {
             Some(cert) => cert,
             None => {
                 if config.tls.require_mtls {
                     debug!("No client certificate, mTLS required");
-                    return match config.failure.spire_unavailable {
-                        FailureMode::FailOpen => {
-                            self.build_fail_open_response("No client certificate")
-                        }
-                        _ => self.build_unauthorized_response("No client certificate", 401),
-                    };
+                    return self.build_unauthorized_response("No client certificate", 401);
                 }
-                // mTLS not required, allow through
-                return AgentResponse::default_allow();
+                // mTLS not required, allow through without an identity
+                return Self::build_anonymous_allow(&config);
             }
         };
 
-        // Get trust bundles from cache (if available)
-        let trust_bundles = if self.workload_client.is_connected().await {
-            Some(self.bundle_cache.get_all().await)
-        } else {
-            None
-        };
+        // A forwarded certificate is only identity if it chains to the SPIRE
+        // trust bundle. Always verify: an empty or missing bundle rejects the
+        // certificate instead of skipping verification.
+        let trust_bundles = self.bundle_cache.get_all().await;
 
         // Validate the certificate
-        let validation = match validate_certificate(cert_header, trust_bundles.as_ref()) {
+        let validation = match validate_certificate(cert_header, Some(&trust_bundles)) {
             Ok(result) => result,
             Err(e) => {
                 let error_msg = e.to_string();
@@ -458,12 +488,12 @@ impl AgentHandlerV2 for SpiffeAgent {
 
                 return match config.failure.validation_failure {
                     ValidationFailureAction::Reject => match config.failure.spire_unavailable {
-                        FailureMode::FailOpen => self.build_fail_open_response(&error_msg),
+                        FailureMode::FailOpen => self.build_fail_open_response(&error_msg, &config),
                         _ => self.build_unauthorized_response(&error_msg, 401),
                     },
                     ValidationFailureAction::LogAndAllow => {
                         warn!(error = %error_msg, "Certificate validation failed, log-and-allow enabled");
-                        AgentResponse::default_allow().with_audit(AuditMetadata {
+                        Self::build_anonymous_allow(&config).with_audit(AuditMetadata {
                             tags: vec![
                                 "spiffe".to_string(),
                                 "validation_failed".to_string(),
@@ -485,7 +515,7 @@ impl AgentHandlerV2 for SpiffeAgent {
         if !validation.valid {
             let error_msg = validation.error.as_deref().unwrap_or("Unknown error");
             return match config.failure.spire_unavailable {
-                FailureMode::FailOpen => self.build_fail_open_response(error_msg),
+                FailureMode::FailOpen => self.build_fail_open_response(error_msg, &config),
                 _ => self.build_unauthorized_response(error_msg, 401),
             };
         }
@@ -495,7 +525,7 @@ impl AgentHandlerV2 for SpiffeAgent {
             Some(id) => id,
             None => {
                 return match config.failure.spire_unavailable {
-                    FailureMode::FailOpen => self.build_fail_open_response("No SPIFFE ID"),
+                    FailureMode::FailOpen => self.build_fail_open_response("No SPIFFE ID", &config),
                     _ => self.build_unauthorized_response("No SPIFFE ID in certificate", 401),
                 };
             }
@@ -781,5 +811,245 @@ mod tests {
         assert_eq!(agent.requests_processed.load(Ordering::Relaxed), 10);
         assert_eq!(agent.requests_allowed.load(Ordering::Relaxed), 8);
         assert_eq!(agent.requests_blocked.load(Ordering::Relaxed), 2);
+    }
+
+    /// Self-signed certificate with URI SAN `spiffe://example.org/frontend`
+    /// (an ID that `test_config()` allows), base64 DER, valid until 2126.
+    /// Anyone can mint one; it must never become an identity.
+    const SELF_SIGNED_SPIFFE_CERT_B64: &str = "MIIBvzCCAWWgAwIBAgIUD+hnRt1zck5cEDDmykWIb+i2/eUwCgYIKoZIzj0EAwIwHzEdMBsGA1UEAwwUc2VsZi1zaWduZWQtYXR0YWNrZXIwIBcNMjYxMDIxMTg0MDQ2WhgPMjEyNjA5MjcxODQwNDZaMB8xHTAbBgNVBAMMFHNlbGYtc2lnbmVkLWF0dGFja2VyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb8rMIb8Jz7LZtZ+XzhoP4f3uM0MD6nUQOfhfinc6MpRGU3s063JA4Goi7ct5fD2HimaEks3yiLYfMp5NS2FSiaN9MHswHQYDVR0OBBYEFNKaHS0U5jd4VbflUz9bP0Yd5c++MB8GA1UdIwQYMBaAFNKaHS0U5jd4VbflUz9bP0Yd5c++MA8GA1UdEwEB/wQFMAMBAf8wKAYDVR0RBCEwH4Ydc3BpZmZlOi8vZXhhbXBsZS5vcmcvZnJvbnRlbmQwCgYIKoZIzj0EAwIDSAAwRQIgb7E2ZXjbTbnARidrI7Fj/GL4CX2+YsSGaV+O9QiLSqECIQDiuPbLyvaz1BMYS/LX75REdoxW2iIK2YUmeqs2GiHZtg==";
+
+    fn request(headers: &[(&str, &str)]) -> RequestHeadersEvent {
+        RequestHeadersEvent {
+            metadata: zentinel_agent_protocol::RequestMetadata {
+                correlation_id: "c".to_string(),
+                request_id: "r".to_string(),
+                client_ip: "203.0.113.7".to_string(),
+                client_port: 40000,
+                server_name: None,
+                protocol: "HTTP/1.1".to_string(),
+                tls_version: None,
+                tls_cipher: None,
+                route_id: None,
+                upstream_id: None,
+                timestamp: "2026-10-21T00:00:00Z".to_string(),
+                traceparent: None,
+            },
+            method: "GET".to_string(),
+            uri: "/".to_string(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), vec![v.to_string()]))
+                .collect(),
+        }
+    }
+
+    /// Headers a client tries to smuggle in, plus a forged certificate.
+    fn spoofed_request() -> RequestHeadersEvent {
+        request(&[
+            ("X-Forwarded-Client-Cert", SELF_SIGNED_SPIFFE_CERT_B64),
+            ("x-spiffe-id", "spiffe://example.org/admin"),
+            ("X-SPIFFE-Trust-Domain", "example.org"),
+            ("X-SPIFFE-Workload-Id", "/admin"),
+            ("X-Auth-Method", "spiffe"),
+            ("X-Auth-Timestamp", "1"),
+        ])
+    }
+
+    fn status(response: &AgentResponse) -> Option<u16> {
+        match &response.decision {
+            zentinel_agent_protocol::Decision::Block { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    fn removed(response: &AgentResponse) -> Vec<String> {
+        response
+            .request_headers
+            .iter()
+            .filter_map(|op| match op {
+                HeaderOp::Remove { name } => Some(name.to_lowercase()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn set(response: &AgentResponse) -> Vec<String> {
+        response
+            .request_headers
+            .iter()
+            .filter_map(|op| match op {
+                HeaderOp::Set { name, .. } | HeaderOp::Add { name, .. } => {
+                    Some(name.to_lowercase())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_identity_headers_stripped(response: &AgentResponse, config: &SpiffeAgentConfig) {
+        let removed = removed(response);
+        for name in [
+            "x-spiffe-id",
+            "x-spiffe-trust-domain",
+            "x-spiffe-workload-id",
+            "x-auth-method",
+            "x-auth-timestamp",
+        ] {
+            assert!(removed.contains(&name.to_string()), "{name} not stripped");
+        }
+        for name in config.identity_header_names() {
+            assert!(
+                removed.contains(&name.to_lowercase()),
+                "{name} not stripped"
+            );
+        }
+        assert!(set(response).is_empty(), "no identity may be set");
+    }
+
+    #[tokio::test]
+    async fn test_rule_a_identity_headers_stripped_when_allowing_without_mtls() {
+        // require-mtls off (default): request passes, but anonymously.
+        let mut config = test_config();
+        config.headers.spiffe_id = "X-Custom-Spiffe".to_string();
+        let agent = SpiffeAgent::new(config.clone()).unwrap();
+        let mut event = spoofed_request();
+        event
+            .headers
+            .insert("X-Custom-Spiffe".to_string(), vec!["forged".to_string()]);
+
+        let response = agent.on_request_headers(event).await;
+        assert_eq!(status(&response), None);
+        assert_identity_headers_stripped(&response, &config);
+        assert!(removed(&response).contains(&"x-custom-spiffe".to_string()));
+        assert_eq!(agent.requests_allowed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_rule_a_identity_headers_stripped_on_fail_open() {
+        // Even the opt-in path's fail-open / log-and-allow branches must strip.
+        let config = test_config();
+        let agent = SpiffeAgent::new(config.clone()).unwrap();
+        {
+            let mut cfg = agent.config.write().await;
+            cfg.tls.trust_forwarded_client_cert = true; // bypasses validate()
+            cfg.failure.spire_unavailable = FailureMode::FailOpen;
+        }
+        let response = agent.on_request_headers(spoofed_request()).await;
+        assert_eq!(status(&response), None);
+        assert_identity_headers_stripped(&response, &config);
+
+        {
+            let mut cfg = agent.config.write().await;
+            cfg.failure.spire_unavailable = FailureMode::FailClosed;
+            cfg.failure.validation_failure = ValidationFailureAction::LogAndAllow;
+        }
+        let response = agent.on_request_headers(spoofed_request()).await;
+        assert_eq!(status(&response), None);
+        assert_identity_headers_stripped(&response, &config);
+    }
+
+    #[test]
+    fn test_fixture_is_a_forgery_unverified_parsing_accepts() {
+        // Guards the tests below: without a trust bundle the certificate is
+        // accepted as `spiffe://example.org/frontend` (what the agent did with
+        // every forwarded certificate before), and with an empty bundle it is
+        // rejected.
+        let unverified = validate_certificate(SELF_SIGNED_SPIFFE_CERT_B64, None).unwrap();
+        assert!(unverified.valid);
+        assert_eq!(
+            unverified.spiffe_id.as_deref(),
+            Some("spiffe://example.org/frontend")
+        );
+        assert!(validate_certificate(SELF_SIGNED_SPIFFE_CERT_B64, Some(&HashMap::new())).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rule_b_forwarded_cert_ignored_by_default() {
+        // A forged certificate in X-Forwarded-Client-Cert must not become an
+        // identity: no X-SPIFFE-Id is set, and with require-mtls it is denied.
+        let mut config = test_config();
+        config.tls.require_mtls = true;
+        let agent = SpiffeAgent::new(config).unwrap();
+        let response = agent.on_request_headers(spoofed_request()).await;
+        assert_eq!(status(&response), Some(401));
+        assert!(set(&response).is_empty());
+        assert_eq!(agent.requests_allowed.load(Ordering::Relaxed), 0);
+        assert_eq!(agent.requests_blocked.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rule_b_opt_in_rejected_by_new_reconfigure_and_on_configure() {
+        let mut opt_in = test_config();
+        opt_in.tls.trust_forwarded_client_cert = true;
+        let err = SpiffeAgent::new(opt_in.clone()).err().unwrap().to_string();
+        assert!(err.contains("zentinel-agent-spiffe#5"), "{err}");
+
+        let agent = SpiffeAgent::new(test_config()).unwrap();
+        assert!(agent.reconfigure(opt_in).await.is_err());
+
+        let accepted = AgentHandlerV2::on_configure(
+            &agent,
+            serde_json::json!({
+                "tls": { "require-mtls": true, "trust-forwarded-client-cert": true },
+                "allowlist": { "exact": ["spiffe://example.org/frontend"] }
+            }),
+            Some("v2".to_string()),
+        )
+        .await;
+        assert!(!accepted, "opt-in config must be refused");
+        let cfg = agent.config.read().await;
+        assert!(!cfg.tls.trust_forwarded_client_cert);
+        drop(cfg);
+        assert!(agent.config_version.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rule_b_opt_in_still_requires_trust_bundle_verification() {
+        // Defence in depth: if the opt-in flag were ever set, a certificate
+        // that does not chain to the trust bundle (here: the bundle cache is
+        // empty, as it is whenever SPIRE has not delivered one) is rejected.
+        let agent = SpiffeAgent::new(test_config()).unwrap();
+        agent.config.write().await.tls.trust_forwarded_client_cert = true;
+        let response = agent.on_request_headers(spoofed_request()).await;
+        assert_eq!(status(&response), Some(401));
+        assert!(set(&response).is_empty());
+        assert_eq!(agent.requests_allowed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_rule_c_require_mtls_without_identity_source_denies() {
+        // No verifiable identity source + require-mtls: deny, whatever the
+        // failure modes say, with and without a client certificate header.
+        for (spire_unavailable, validation_failure) in [
+            (FailureMode::FailClosed, ValidationFailureAction::Reject),
+            (FailureMode::FailOpen, ValidationFailureAction::LogAndAllow),
+            (FailureMode::Cache, ValidationFailureAction::Reject),
+        ] {
+            let mut config = test_config();
+            config.tls.require_mtls = true;
+            config.failure.spire_unavailable = spire_unavailable;
+            config.failure.validation_failure = validation_failure;
+            let agent = SpiffeAgent::new(config).unwrap();
+
+            for event in [request(&[]), spoofed_request()] {
+                let response = agent.on_request_headers(event).await;
+                assert_eq!(status(&response), Some(401), "{spire_unavailable:?}");
+                assert!(set(&response).is_empty());
+            }
+            assert_eq!(agent.requests_allowed.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rule_c_require_mtls_opt_in_missing_cert_denies_even_fail_open() {
+        let agent = SpiffeAgent::new(test_config()).unwrap();
+        {
+            let mut cfg = agent.config.write().await;
+            cfg.tls.trust_forwarded_client_cert = true;
+            cfg.tls.require_mtls = true;
+            cfg.failure.spire_unavailable = FailureMode::FailOpen;
+        }
+        let response = agent.on_request_headers(request(&[])).await;
+        assert_eq!(status(&response), Some(401));
     }
 }
