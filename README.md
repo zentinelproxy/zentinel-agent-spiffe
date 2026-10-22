@@ -13,6 +13,7 @@
 
 <p align="center">
   <a href="https://github.com/zentinelproxy/zentinel-agent-spiffe/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/zentinelproxy/zentinel-agent-spiffe/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-9b4d8a?style=flat&labelColor=1f161e">
   <img alt="Rust: 1.94.1+" src="https://img.shields.io/badge/rust-1.94.1%2B-f68d31?style=flat&labelColor=1f161e&logo=rust&logoColor=white">
   <img alt="Agent protocol: v2" src="https://img.shields.io/badge/agent%20protocol-v2-f68d31?style=flat&labelColor=1f161e">
 </p>
@@ -224,7 +225,7 @@ Minimum Rust: 1.94.1 (`rust-version` in `Cargo.toml`).
 
 ## License
 
-Apache-2.0, as declared in `Cargo.toml`. The repository has no `LICENSE` file yet.
+Apache-2.0, see [`LICENSE`](LICENSE).
 
 ---
 
