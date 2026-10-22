@@ -34,6 +34,13 @@
 > expiry and for a SPIFFE ID). Zentinel also does not set
 > `X-Forwarded-Client-Cert` itself, so the header the agent reads is whatever the
 > client or a TLS-terminating hop in front of Zentinel sent.
+>
+> Until the agent can verify a forwarded certificate against the SPIRE trust
+> bundle ([#5](https://github.com/zentinelproxy/zentinel-agent-spiffe/issues/5)),
+> it fails closed: it never treats `X-Forwarded-Client-Cert` as identity, so it
+> never sets the identity headers, and with `require-mtls` it denies every
+> request with `401`. The opt-in `tls.trust-forwarded-client-cert` is refused.
+> Client-supplied identity headers are always removed.
 
 For service-to-service traffic where each workload holds a SPIFFE X.509 SVID.
 The agent takes the certificate from `X-Forwarded-Client-Cert` (PEM,
@@ -159,7 +166,8 @@ Settings accepted through the configure event (JSON, kebab-case). There is no
 | `spire.bundle-refresh-interval` | `300` | Seconds between trust bundle refreshes |
 | `spire.api-timeout-ms` | `5000` | Workload API timeout |
 | `tls.client-cert-header` | `X-Forwarded-Client-Cert` | Header carrying the client certificate |
-| `tls.require-mtls` | `false` | Reject requests without the header; when `false` they pass unchecked |
+| `tls.require-mtls` | `false` | Reject requests without a verified identity (currently every request, `401`); when `false` they pass without identity headers |
+| `tls.trust-forwarded-client-cert` | `false` | Treat `client-cert-header` as identity because a trusted front proxy sets it. `true` is rejected until trust-bundle verification exists (#5) |
 | `headers.spiffe-id` / `trust-domain` / `workload-id` / `auth-method` / `auth-timestamp` | `X-SPIFFE-Id` / `X-SPIFFE-Trust-Domain` / `X-SPIFFE-Workload-Id` / `X-Auth-Method` / `X-Auth-Timestamp` | Names of the headers added on success |
 | `allowlist.exact` / `prefix` / `trust-domains` / `patterns` | all empty | Allowed SPIFFE IDs; all empty allows every ID |
 | `failure.spire-unavailable` | `fail_closed` | `fail_open` turns any validation failure into an allow; `cache` behaves like `fail_closed` |
@@ -175,16 +183,20 @@ Proxy-side options (`events`, `timeout-ms`, `failure-mode`):
 
 ## How it works
 
-1. Read the certificate header (case-insensitive). Missing: allow, or `401`
+1. Remove any client-supplied identity headers (the configured names and the
+   defaults) from every request the agent lets through.
+2. Without `trust-forwarded-client-cert` (always, for now) there is no
+   verifiable identity: allow without identity, or `401` when `require-mtls`
+   is set, regardless of the failure modes.
+3. Read the certificate header (case-insensitive). Missing: allow, or `401`
    when `require-mtls` is set.
-2. Decode the certificate, require a `spiffe://` URI SAN, reject it if expired.
-3. If the agent is connected to SPIRE, require that a CA from the trust bundle
-   for the ID's trust domain signed it.
-4. Match the SPIFFE ID against the allowlist; outside it, `403`.
-5. Allow, adding the identity headers to the upstream request.
+4. Decode the certificate, require a `spiffe://` URI SAN, reject it if expired.
+5. Require that a CA from the trust bundle for the ID's trust domain signed it;
+   an empty bundle rejects it.
+6. Match the SPIFFE ID against the allowlist; outside it, `403`.
+7. Allow, adding the identity headers to the upstream request.
 
-Identity headers a client sends itself are not removed when the agent does not
-set them (no certificate header and `require-mtls` off). The agent reports
+The agent reports
 `spiffe_agent_requests_total`, `..._allowed_total`, `..._blocked_total` and
 `spiffe_agent_spire_connected` as v2 metrics, and reports itself degraded
 while the SPIRE socket does not exist.
