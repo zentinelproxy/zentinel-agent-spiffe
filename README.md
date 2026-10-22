@@ -26,7 +26,7 @@
 
 > [!WARNING]
 > **Do not rely on this agent for authentication yet.** Its policy (allowlist,
-> `require-mtls`, failure modes, header names) can only be set through the
+> failure modes, header names; `require-mtls` also has a flag) can only be set through the
 > agent protocol's configure event, and the current proxy does not forward an
 > agent block's `config { }` to agents. Started from the command line, the agent
 > therefore runs with its defaults: mTLS not required, an empty allowlist that
@@ -156,10 +156,12 @@ Command-line flags, the only settings read at startup:
 | `--socket <PATH>` | `AGENT_SOCKET` | `/tmp/zentinel-spiffe.sock` | Unix socket to listen on |
 | `--grpc-address <ADDR>` | `AGENT_GRPC_ADDRESS` | none | Serve gRPC on this address instead of the socket |
 | `--spire-socket <PATH>` | `SPIRE_AGENT_SOCKET` | `/run/spire/sockets/agent.sock` | SPIRE agent socket; only connected to after a configure event |
+| `--require-mtls` | `SPIFFE_REQUIRE_MTLS` | off | Start with `tls.require-mtls` set (unreleased, `main` only). A configure event replaces the whole configuration, this setting included |
 | `-v, --verbose` | `SPIFFE_VERBOSE` | off | Debug logging |
 
 Settings accepted through the configure event (JSON, kebab-case). There is no
-`--config` file option, so none of these can be set from the command line:
+`--config` file option, so apart from `--require-mtls` none of these can be set
+from the command line:
 
 | Option | Default | Meaning |
 |---|---|---|

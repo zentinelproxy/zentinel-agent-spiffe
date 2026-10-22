@@ -61,6 +61,7 @@ fn now_ms() -> u64 {
 #[derive(Parser, Debug)]
 #[command(name = "zentinel-spiffe-agent")]
 #[command(about = "SPIFFE/SPIRE workload identity agent for Zentinel reverse proxy")]
+#[command(version)]
 struct Args {
     /// Path to Unix socket (UDS mode)
     #[arg(
@@ -81,6 +82,12 @@ struct Args {
         env = "SPIRE_AGENT_SOCKET"
     )]
     spire_socket: PathBuf,
+
+    /// Deny every request that has no verifiable client identity (sets
+    /// `tls.require-mtls`). A `config { }` block from the proxy replaces the
+    /// whole configuration, including this setting.
+    #[arg(long, env = "SPIFFE_REQUIRE_MTLS")]
+    require_mtls: bool,
 
     /// Enable verbose logging
     #[arg(short, long, env = "SPIFFE_VERBOSE")]
@@ -559,6 +566,14 @@ impl AgentHandlerV2 for SpiffeAgent {
     }
 }
 
+/// The configuration the agent starts with, before any configure event.
+fn config_from_args(args: &Args) -> SpiffeAgentConfig {
+    let mut config = SpiffeAgentConfig::default();
+    config.spire.socket = args.spire_socket.clone();
+    config.tls.require_mtls = args.require_mtls;
+    config
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command line arguments
@@ -582,8 +597,7 @@ async fn main() -> Result<()> {
     );
 
     // Build default configuration from args
-    let mut config = SpiffeAgentConfig::default();
-    config.spire.socket = args.spire_socket;
+    let config = config_from_args(&args);
 
     info!(
         spire_socket = %config.spire.socket.display(),
@@ -1051,5 +1065,18 @@ mod tests {
         }
         let response = agent.on_request_headers(request(&[])).await;
         assert_eq!(status(&response), Some(401));
+    }
+
+    #[tokio::test]
+    async fn require_mtls_flag_denies_requests_without_identity() {
+        let args = Args::try_parse_from(["zentinel-spiffe-agent", "--require-mtls"]).unwrap();
+        let agent = SpiffeAgent::new(config_from_args(&args)).unwrap();
+        let response = agent.on_request_headers(request(&[])).await;
+        assert_eq!(status(&response), Some(401));
+
+        let args = Args::try_parse_from(["zentinel-spiffe-agent"]).unwrap();
+        let agent = SpiffeAgent::new(config_from_args(&args)).unwrap();
+        let response = agent.on_request_headers(request(&[])).await;
+        assert_eq!(status(&response), None);
     }
 }
