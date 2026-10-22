@@ -26,8 +26,8 @@ permissions:
 
 jobs:
   release:
-    uses: zentinelproxy/.github/.github/workflows/agent-release.yml@ci/agent-release
+    uses: zentinelproxy/.github/.github/workflows/agent-release.yml@v1
     with:
       binary: zentinel-spiffe-agent
       smoke-command: scripts/smoke-test.sh
-      harness-ref: ci/agent-release
+      harness-ref: v1
