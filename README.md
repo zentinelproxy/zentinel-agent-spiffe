@@ -27,9 +27,10 @@
 > [!WARNING]
 > **Do not rely on this agent for authentication yet.** Its policy (allowlist,
 > failure modes, header names; `require-mtls` also has a flag) can only be set through the
-> agent protocol's configure event, and the current proxy does not forward an
-> agent block's `config { }` to agents. Started from the command line, the agent
-> therefore runs with its defaults: mTLS not required, an empty allowlist that
+> agent protocol's configure event. Zentinel 26.10_8 and later send the agent
+> block's `config { }` on every connection (releases up to 0.6.50 never did);
+> on those releases, or without a `config { }` block, the agent runs with its
+> defaults: mTLS not required, an empty allowlist that
 > allows every SPIFFE ID, and no connection to the SPIRE Workload API, so
 > certificates are not verified against a trust bundle (only parsed, checked for
 > expiry and for a SPIFFE ID). Zentinel also does not set
@@ -159,7 +160,12 @@ Command-line flags, the only settings read at startup:
 | `--require-mtls` | `SPIFFE_REQUIRE_MTLS` | off | Start with `tls.require-mtls` set (unreleased, `main` only). A configure event replaces the whole configuration, this setting included |
 | `-v, --verbose` | `SPIFFE_VERBOSE` | off | Debug logging |
 
-Settings accepted through the configure event (JSON, kebab-case). There is no
+Settings accepted through the configure event (JSON, kebab-case), which
+Zentinel 26.10_8 and later fill from the agent block's `config { }` (over gRPC
+only a build against `zentinel-agent-protocol` 0.6.51 or later receives it,
+which the lockfile's 0.6.24 is not). A block the agent cannot parse, or one
+that sets `tls.trust-forwarded-client-cert`, is refused; Zentinel then does
+not use the agent and its filters' `failure-mode` applies. There is no
 `--config` file option, so apart from `--require-mtls` none of these can be set
 from the command line:
 
