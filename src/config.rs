@@ -35,17 +35,32 @@ pub struct SpiffeAgentConfig {
 impl SpiffeAgentConfig {
     /// Reject configurations this agent cannot enforce safely.
     pub fn validate(&self) -> Result<(), String> {
-        if self.tls.trust_forwarded_client_cert {
-            return Err(format!(
-                "tls.trust-forwarded-client-cert is set, but this agent cannot verify a \
-                 forwarded client certificate against the SPIRE trust bundle (trust bundles \
-                 are never fetched and only a single signature is checked), so `{}` would be \
-                 client-controlled identity; refusing the configuration \
-                 (zentinelproxy/zentinel-agent-spiffe#5)",
-                self.tls.client_cert_header
-            ));
+        if self.tls.trust_forwarded_client_cert && self.tls.client_cert_header.trim().is_empty() {
+            return Err(
+                "tls.trust-forwarded-client-cert is set but tls.client-cert-header is empty"
+                    .to_string(),
+            );
         }
         Ok(())
+    }
+
+    /// Client certificate header names whose value the agent does not trust
+    /// and therefore removes from the upstream request: the configured
+    /// header unless `trust-forwarded-client-cert` is set, and the default
+    /// `X-Forwarded-Client-Cert` unless it is the trusted header.
+    pub fn untrusted_client_cert_header_names(&self) -> Vec<String> {
+        let default = default_client_cert_header();
+        let configured = &self.tls.client_cert_header;
+        let mut names = Vec::new();
+        if !self.tls.trust_forwarded_client_cert && !configured.trim().is_empty() {
+            names.push(configured.clone());
+        }
+        let default_trusted =
+            self.tls.trust_forwarded_client_cert && configured.eq_ignore_ascii_case(&default);
+        if !default_trusted && !names.iter().any(|n| n.eq_ignore_ascii_case(&default)) {
+            names.push(default);
+        }
+        names
     }
 
     /// Names of every identity header this agent emits, plus the default
@@ -138,15 +153,18 @@ pub struct TlsConfig {
     #[serde(default)]
     pub require_mtls: bool,
 
-    /// Treat `client-cert-header` as the client's identity.
+    /// Treat `client-cert-header` as the client's certificate.
     ///
     /// Zentinel does not set that header, so unless a trusted TLS-terminating
     /// proxy in front of Zentinel sets it (and strips any client-supplied
-    /// copy), its value is chosen by the client. Defaults to `false`. Opting in
-    /// also requires verifying the certificate chain against the SPIRE trust
-    /// bundle, which this agent does not implement yet, so a configuration
-    /// that sets this to `true` is rejected (see
-    /// zentinelproxy/zentinel-agent-spiffe#5).
+    /// copy), its value is chosen by the client. Defaults to `false`: the
+    /// header is then never read, and it is removed from the upstream request.
+    ///
+    /// When `true`, the certificate is only an identity if it chains to the
+    /// SPIRE trust bundle of its trust domain (fetched from the Workload API).
+    /// Path validation stops a forged certificate, but not a replayed copy of
+    /// a real one, so only enable this behind a proxy that overwrites the
+    /// header (see zentinelproxy/zentinel-agent-spiffe#5).
     #[serde(default)]
     pub trust_forwarded_client_cert: bool,
 }
@@ -414,13 +432,19 @@ mod tests {
     }
 
     #[test]
-    fn test_trust_forwarded_client_cert_opt_in_rejected() {
+    fn test_trust_forwarded_client_cert_opt_in_accepted() {
+        // The opt-in is usable now that forwarded certificates are path-validated
+        // against the SPIRE trust bundle; it still needs a header to read.
         let json = r#"{ "tls": { "require-mtls": true, "trust-forwarded-client-cert": true } }"#;
         let config: SpiffeAgentConfig = serde_json::from_str(json).unwrap();
         assert!(config.tls.trust_forwarded_client_cert);
+        assert!(config.validate().is_ok());
+
+        let json =
+            r#"{ "tls": { "trust-forwarded-client-cert": true, "client-cert-header": " " } }"#;
+        let config: SpiffeAgentConfig = serde_json::from_str(json).unwrap();
         let err = config.validate().unwrap_err();
-        assert!(err.contains("zentinel-agent-spiffe#5"), "{err}");
-        assert!(err.contains("trust-forwarded-client-cert"), "{err}");
+        assert!(err.contains("client-cert-header"), "{err}");
     }
 
     #[test]

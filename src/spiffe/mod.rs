@@ -8,5 +8,7 @@
 mod validation;
 mod workload_api;
 
+#[cfg(test)]
+pub use validation::extract_spiffe_id_from_cert;
 pub use validation::{validate_certificate, ValidationResult};
 pub use workload_api::{TrustBundleCache, WorkloadApiClient};

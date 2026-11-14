@@ -30,19 +30,21 @@
 > agent protocol's configure event. Zentinel 26.10_8 and later send the agent
 > block's `config { }` on every connection (releases up to 0.6.50 never did);
 > on those releases, or without a `config { }` block, the agent runs with its
-> defaults: mTLS not required, an empty allowlist that
-> allows every SPIFFE ID, and no connection to the SPIRE Workload API, so
-> certificates are not verified against a trust bundle (only parsed, checked for
-> expiry and for a SPIFFE ID). Zentinel also does not set
-> `X-Forwarded-Client-Cert` itself, so the header the agent reads is whatever the
-> client or a TLS-terminating hop in front of Zentinel sent.
+> defaults: mTLS not required and an empty allowlist that
+> allows every SPIFFE ID. Zentinel does not tell agents which client
+> certificate it verified, and does not set `X-Forwarded-Client-Cert` itself, so
+> that header is whatever the client or a TLS-terminating hop in front of
+> Zentinel sent ([#5](https://github.com/zentinelproxy/zentinel-agent-spiffe/issues/5)).
 >
-> Until the agent can verify a forwarded certificate against the SPIRE trust
-> bundle ([#5](https://github.com/zentinelproxy/zentinel-agent-spiffe/issues/5)),
-> it fails closed: it never treats `X-Forwarded-Client-Cert` as identity, so it
-> never sets the identity headers, and with `require-mtls` it denies every
-> request with `401`. The opt-in `tls.trust-forwarded-client-cert` is refused.
-> Client-supplied identity headers are always removed.
+> By default the agent therefore fails closed: it never treats
+> `X-Forwarded-Client-Cert` as identity and removes it from the upstream
+> request, never sets the identity headers, and with `require-mtls` denies
+> every request with `401`. Client-supplied identity headers are always
+> removed. `tls.trust-forwarded-client-cert` opts in to reading the header,
+> only for deployments where a proxy in front of Zentinel terminates mTLS and
+> overwrites it: the forwarded certificate must then chain to the SPIRE trust
+> bundle, but a certificate is not a secret, so a client that can set the
+> header itself can replay any real workload's certificate.
 
 For service-to-service traffic where each workload holds a SPIFFE X.509 SVID.
 The agent takes the certificate from `X-Forwarded-Client-Cert` (PEM,
@@ -163,8 +165,8 @@ Command-line flags, the only settings read at startup:
 Settings accepted through the configure event (JSON, kebab-case), which
 Zentinel 26.10_8 and later fill from the agent block's `config { }` (over gRPC
 only a build against `zentinel-agent-protocol` 0.6.51 or later receives it,
-which the lockfile's 0.6.24 is not). A block the agent cannot parse, or one
-that sets `tls.trust-forwarded-client-cert`, is refused; Zentinel then does
+which the lockfile's 0.6.24 is not). A block the agent cannot parse is
+refused; Zentinel then does
 not use the agent and its filters' `failure-mode` applies. There is no
 `--config` file option, so apart from `--require-mtls` none of these can be set
 from the command line:
@@ -174,9 +176,9 @@ from the command line:
 | `spire.socket` | `/run/spire/sockets/agent.sock` | SPIRE Workload API socket |
 | `spire.bundle-refresh-interval` | `300` | Seconds between trust bundle refreshes |
 | `spire.api-timeout-ms` | `5000` | Workload API timeout |
-| `tls.client-cert-header` | `X-Forwarded-Client-Cert` | Header carrying the client certificate |
-| `tls.require-mtls` | `false` | Reject requests without a verified identity (currently every request, `401`); when `false` they pass without identity headers |
-| `tls.trust-forwarded-client-cert` | `false` | Treat `client-cert-header` as identity because a trusted front proxy sets it. `true` is rejected until trust-bundle verification exists (#5) |
+| `tls.client-cert-header` | `X-Forwarded-Client-Cert` | Header carrying the client certificate (URL-encoded or raw PEM, leaf first and optional intermediates after it, or base64 DER) |
+| `tls.require-mtls` | `false` | Reject requests without a verified identity (`401`; without `trust-forwarded-client-cert` that is every request); when `false` they pass without identity headers |
+| `tls.trust-forwarded-client-cert` | `false` | Read `client-cert-header` because a trusted front proxy sets it (and overwrites any client copy). Starts fetching trust bundles from `spire.socket`; until the first fetch succeeds every certificate is rejected |
 | `headers.spiffe-id` / `trust-domain` / `workload-id` / `auth-method` / `auth-timestamp` | `X-SPIFFE-Id` / `X-SPIFFE-Trust-Domain` / `X-SPIFFE-Workload-Id` / `X-Auth-Method` / `X-Auth-Timestamp` | Names of the headers added on success |
 | `allowlist.exact` / `prefix` / `trust-domains` / `patterns` | all empty | Allowed SPIFFE IDs; all empty allows every ID |
 | `failure.spire-unavailable` | `fail_closed` | `fail_open` turns any validation failure into an allow; `cache` behaves like `fail_closed` |
@@ -194,14 +196,23 @@ Proxy-side options (`events`, `timeout-ms`, `failure-mode`):
 
 1. Remove any client-supplied identity headers (the configured names and the
    defaults) from every request the agent lets through.
-2. Without `trust-forwarded-client-cert` (always, for now) there is no
-   verifiable identity: allow without identity, or `401` when `require-mtls`
-   is set, regardless of the failure modes.
+2. Without `trust-forwarded-client-cert` (the default) there is no
+   verifiable identity: remove the client certificate header too, then allow
+   without identity, or `401` when `require-mtls` is set, regardless of the
+   failure modes.
 3. Read the certificate header (case-insensitive). Missing: allow, or `401`
    when `require-mtls` is set.
-4. Decode the certificate, require a `spiffe://` URI SAN, reject it if expired.
-5. Require that a CA from the trust bundle for the ID's trust domain signed it;
-   an empty bundle rejects it.
+4. Decode the certificate (and any intermediates after it), require exactly
+   one URI SAN and that it is a `spiffe://` ID, reject it if expired.
+5. Validate the path from the certificate to a CA in the SPIRE trust bundle
+   for the ID's trust domain (`rustls-webpki`: every signature, validity
+   period and basic constraint on the path, and the client-auth extended key
+   usage), so a self-signed certificate, one from another CA, a CA
+   certificate or a server-only certificate is rejected. No bundle for the
+   trust domain rejects it. Bundles are fetched from the Workload API when
+   the agent starts or is configured with `trust-forwarded-client-cert`, then
+   every `spire.bundle-refresh-interval` seconds (every 5 s after a failure,
+   keeping the last good bundle).
 6. Match the SPIFFE ID against the allowlist; outside it, `403`.
 7. Allow, adding the identity headers to the upstream request.
 
