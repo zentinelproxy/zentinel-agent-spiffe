@@ -115,7 +115,8 @@ pub struct SpiffeAgent {
     /// Whether the agent is draining.
     draining: RwLock<bool>,
     /// Background task keeping `bundle_cache` filled from SPIRE; started the
-    /// first time a configuration trusts the forwarded certificate header.
+    /// first time a configuration reads client certificates. `validate()`
+    /// refuses the only such setting today, so it does not run yet (#5).
     bundle_watch: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -212,9 +213,9 @@ impl SpiffeAgent {
     /// request, so a client cannot supply them itself. Applied to every
     /// response that lets the request through, before any identity is set.
     ///
-    /// A client certificate header that is not trusted is removed too: its
-    /// value is whatever the client sent, and an upstream that reads it (as
-    /// Envoy-style services read `X-Forwarded-Client-Cert`) must not see it.
+    /// The client certificate header is removed too: its value is whatever
+    /// the client sent, and an upstream that reads it (as Envoy-style
+    /// services read `X-Forwarded-Client-Cert`) must not see it.
     fn strip_identity_headers(
         mut response: AgentResponse,
         config: &SpiffeAgentConfig,
@@ -222,7 +223,7 @@ impl SpiffeAgent {
         for name in config.identity_header_names() {
             response = response.add_request_header(HeaderOp::Remove { name });
         }
-        for name in config.untrusted_client_cert_header_names() {
+        for name in config.client_cert_header_names() {
             response = response.add_request_header(HeaderOp::Remove { name });
         }
         response
@@ -492,8 +493,10 @@ impl AgentHandlerV2 for SpiffeAgent {
 
         // Zentinel does not tell agents which peer certificate it verified, and
         // it never sets the client-certificate header itself, so that header is
-        // client-controlled unless a trusted front proxy sets it. Without the
-        // explicit opt-in there is no verifiable identity source at all.
+        // client-controlled. `validate()` refuses the opt-in, so in a running
+        // agent there is no verifiable identity source at all and every request
+        // takes this branch. The path below (chain validation against the
+        // SPIRE bundle) waits for a verified certificate source (#5).
         if !config.tls.trust_forwarded_client_cert {
             if config.tls.require_mtls {
                 debug!("No verifiable client identity source, mTLS required");
@@ -1029,30 +1032,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rule_b_opt_in_accepted_by_new_reconfigure_and_on_configure() {
+    async fn test_rule_b_opt_in_rejected_by_new_reconfigure_and_on_configure() {
         let mut opt_in = test_config();
         opt_in.tls.trust_forwarded_client_cert = true;
-        opt_in.spire.socket = PathBuf::from("/nonexistent/spire.sock");
-        assert!(SpiffeAgent::new(opt_in.clone()).is_ok());
+        let err = SpiffeAgent::new(opt_in.clone()).err().unwrap().to_string();
+        assert!(err.contains("zentinel-agent-spiffe#5"), "{err}");
 
         let agent = SpiffeAgent::new(test_config()).unwrap();
-        assert!(agent.reconfigure(opt_in).await.is_ok());
-        assert!(agent.bundle_watch.lock().unwrap().is_some());
+        assert!(agent.reconfigure(opt_in).await.is_err());
 
-        let agent = SpiffeAgent::new(test_config()).unwrap();
         let accepted = AgentHandlerV2::on_configure(
             &agent,
             serde_json::json!({
-                "spire": { "socket": "/nonexistent/spire.sock" },
                 "tls": { "require-mtls": true, "trust-forwarded-client-cert": true },
                 "allowlist": { "exact": ["spiffe://example.org/frontend"] }
             }),
             Some("v2".to_string()),
         )
         .await;
-        assert!(accepted);
-        assert!(agent.config.read().await.tls.trust_forwarded_client_cert);
-        // No SPIRE, so no bundle: the forged certificate is still refused.
+        assert!(!accepted, "opt-in config must be refused");
+        let cfg = agent.config.read().await;
+        assert!(!cfg.tls.trust_forwarded_client_cert);
+        drop(cfg);
+        assert!(agent.config_version.read().await.is_none());
+        assert!(
+            agent.bundle_watch.lock().unwrap().is_none(),
+            "a refused configuration must not start the bundle watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bundle_watch_starts_only_for_a_config_that_reads_certificates() {
+        // Groundwork for a verified certificate source (#5): the watch is
+        // started once, and only for a configuration that reads certificates.
+        let agent = SpiffeAgent::new(test_config()).unwrap();
+        agent.ensure_bundle_watch(&test_config());
+        assert!(agent.bundle_watch.lock().unwrap().is_none());
+
+        let mut reads = test_config();
+        reads.tls.trust_forwarded_client_cert = true; // bypasses validate()
+        agent.ensure_bundle_watch(&reads);
+        assert!(agent.bundle_watch.lock().unwrap().is_some());
+        // No SPIRE, so no bundle: a forged certificate is still refused.
+        *agent.config.write().await = reads;
+        agent.config.write().await.tls.require_mtls = true;
         let response = agent.on_request_headers(spoofed_request()).await;
         assert_eq!(status(&response), Some(401));
         assert!(set(&response).is_empty());
@@ -1224,8 +1247,9 @@ mod tests {
         urlencoding::encode(&pems.concat()).into_owned()
     }
 
-    /// An agent that trusts the forwarded header, with `bundles` loaded as
-    /// if fetched from SPIRE.
+    /// An agent that reads the forwarded header (bypassing `validate()`, which
+    /// refuses that), with `bundles` loaded as if fetched from SPIRE. It
+    /// exercises the chain validation a verified certificate source will use.
     async fn opt_in_agent(bundles: &[(&str, &Ca)]) -> SpiffeAgent {
         let agent = SpiffeAgent::new(test_config()).unwrap();
         agent.config.write().await.tls.trust_forwarded_client_cert = true;
@@ -1386,18 +1410,5 @@ mod tests {
         let removed = removed(&response);
         assert!(removed.contains(&"x-client-cert".to_string()));
         assert!(removed.contains(&"x-forwarded-client-cert".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_trusted_client_cert_header_is_kept_upstream() {
-        // Opted in: the front proxy set the header, so it is passed on.
-        let root = root_ca("spire root");
-        let agent = opt_in_agent(&[("example.org", &root)]).await;
-        let leaf = mint(&["spiffe://example.org/frontend"], &root, Kind::Svid);
-        let response = agent
-            .on_request_headers(request(&[("X-Forwarded-Client-Cert", &xfcc(&[&leaf]))]))
-            .await;
-        assert_eq!(status(&response), None);
-        assert!(!removed(&response).contains(&"x-forwarded-client-cert".to_string()));
     }
 }
