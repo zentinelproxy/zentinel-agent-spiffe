@@ -106,13 +106,14 @@ pub struct CertificateInfo {
     pub claims: HashMap<String, String>,
 }
 
-/// Decode a client certificate from a header value.
+/// Decode a client certificate from a header value, plus any intermediates
+/// that follow it.
 ///
-/// Supports multiple encoding formats:
-/// - URL-encoded PEM
-/// - Base64-encoded DER
-/// - Raw PEM (newlines replaced with spaces or %0A)
-pub fn decode_certificate(header_value: &str) -> Result<Vec<u8>, ValidationError> {
+/// Supports URL-encoded PEM, raw PEM (newlines replaced with spaces) and
+/// base64-encoded DER. The first certificate is the leaf (the SVID). Further PEM blocks, if
+/// present, are treated as untrusted intermediates for path building; they
+/// never act as trust anchors.
+pub fn decode_certificate_chain(header_value: &str) -> Result<Vec<Vec<u8>>, ValidationError> {
     let header_value = header_value.trim();
 
     // Try URL-decoded PEM first
@@ -120,7 +121,7 @@ pub fn decode_certificate(header_value: &str) -> Result<Vec<u8>, ValidationError
         let decoded_str = decoded.as_ref();
         if decoded_str.contains("-----BEGIN CERTIFICATE-----") {
             trace!("Decoding URL-encoded PEM certificate");
-            return parse_pem_to_der(decoded_str);
+            return parse_pem_chain_to_der(decoded_str);
         }
     }
 
@@ -136,28 +137,30 @@ pub fn decode_certificate(header_value: &str) -> Result<Vec<u8>, ValidationError
                 "-----BEGIN CERTIFICATE-----\n",
             )
             .replace(" -----END CERTIFICATE-----", "\n-----END CERTIFICATE-----");
-        return parse_pem_to_der(&pem_str);
+        return parse_pem_chain_to_der(&pem_str);
     }
 
     // Try base64-encoded DER
     trace!("Trying base64-encoded DER certificate");
     BASE64
         .decode(header_value)
+        .map(|der| vec![der])
         .map_err(|e| ValidationError::DecodingFailed(format!("Base64 decode failed: {}", e)))
 }
 
-/// Parse a PEM certificate string to DER bytes.
-fn parse_pem_to_der(pem_str: &str) -> Result<Vec<u8>, ValidationError> {
+/// Parse every PEM certificate in a string to DER bytes, in order.
+fn parse_pem_chain_to_der(pem_str: &str) -> Result<Vec<Vec<u8>>, ValidationError> {
     let mut reader = std::io::Cursor::new(pem_str.as_bytes());
     let certs = rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ValidationError::ParseFailed(format!("PEM parse failed: {}", e)))?;
 
-    certs
-        .into_iter()
-        .next()
-        .map(|c| c.to_vec())
-        .ok_or_else(|| ValidationError::ParseFailed("No certificate found in PEM".to_string()))
+    if certs.is_empty() {
+        return Err(ValidationError::ParseFailed(
+            "No certificate found in PEM".to_string(),
+        ));
+    }
+    Ok(certs.into_iter().map(|c| c.to_vec()).collect())
 }
 
 /// Extract the SPIFFE ID from an X.509 certificate.
@@ -167,19 +170,33 @@ pub fn extract_spiffe_id_from_cert(cert_der: &[u8]) -> Result<String, Validation
     let (_, cert) = X509Certificate::from_der(cert_der)
         .map_err(|e| ValidationError::ParseFailed(format!("DER parse failed: {}", e)))?;
 
-    // Look for SPIFFE ID in SAN URIs
-    if let Ok(Some(san)) = cert.subject_alternative_name() {
-        for name in &san.value.general_names {
-            if let GeneralName::URI(uri) = name {
-                if uri.starts_with("spiffe://") {
-                    trace!(spiffe_id = %uri, "Found SPIFFE ID in certificate SAN");
-                    return Ok(uri.to_string());
-                }
-            }
-        }
-    }
+    // An X.509-SVID carries exactly one URI SAN, and it is the SPIFFE ID
+    // (SPIFFE X509-SVID spec, section 2). More than one is not an SVID.
+    let uris: Vec<&str> = match cert.subject_alternative_name() {
+        Ok(Some(san)) => san
+            .value
+            .general_names
+            .iter()
+            .filter_map(|name| match name {
+                GeneralName::URI(uri) => Some(*uri),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
 
-    Err(ValidationError::NoSpiffeId)
+    match uris.as_slice() {
+        [uri] if uri.starts_with("spiffe://") => {
+            trace!(spiffe_id = %uri, "Found SPIFFE ID in certificate SAN");
+            Ok(uri.to_string())
+        }
+        [] => Err(ValidationError::NoSpiffeId),
+        [uri] => Err(ValidationError::InvalidSpiffeId(uri.to_string())),
+        _ => Err(ValidationError::InvalidSpiffeId(format!(
+            "certificate has {} URI SANs, an X.509-SVID has exactly one",
+            uris.len()
+        ))),
+    }
 }
 
 /// Validate a client certificate and extract SPIFFE identity.
@@ -189,13 +206,19 @@ pub fn extract_spiffe_id_from_cert(cert_der: &[u8]) -> Result<String, Validation
 /// 2. Certificate parsing
 /// 3. SPIFFE ID extraction from SAN
 /// 4. Validity period check
-/// 5. Trust bundle verification (if bundles provided)
+/// 5. Path validation against the trust bundle of the SVID's trust domain
+///
+/// A certificate is only ever accepted if it chains to a CA in the bundle
+/// for its own trust domain. `None`, an empty map, or a map without that
+/// trust domain all reject: there is no "parse only" mode.
 pub fn validate_certificate(
     cert_header: &str,
     trust_bundles: Option<&HashMap<String, Vec<Vec<u8>>>>,
 ) -> Result<ValidationResult, ValidationError> {
-    // Decode the certificate
-    let cert_der = decode_certificate(cert_header)?;
+    // Decode the certificate and any intermediates sent with it
+    let mut chain = decode_certificate_chain(cert_header)?;
+    let cert_der = chain.remove(0);
+    let intermediates = chain;
 
     // Parse the certificate
     let (_, cert) = X509Certificate::from_der(&cert_der)
@@ -236,29 +259,10 @@ pub fn validate_certificate(
         return Err(ValidationError::Expired);
     }
 
-    // Verify against trust bundle if provided
-    if let Some(bundles) = trust_bundles {
-        if let Some(bundle) = bundles.get(&trust_domain) {
-            // Verify the certificate was issued by one of the trusted CAs
-            let mut verified = false;
-            for ca_der in bundle {
-                if verify_certificate_signature(&cert_der, ca_der).is_ok() {
-                    verified = true;
-                    break;
-                }
-            }
-
-            if !verified {
-                warn!(
-                    spiffe_id = %spiffe_id,
-                    trust_domain = %trust_domain,
-                    "Certificate not signed by any CA in trust bundle"
-                );
-                return Err(ValidationError::ChainVerificationFailed(
-                    "Certificate not signed by any trusted CA".to_string(),
-                ));
-            }
-        } else {
+    // Verify against the trust bundle of this trust domain
+    let bundle = match trust_bundles.and_then(|b| b.get(&trust_domain)) {
+        Some(bundle) if !bundle.is_empty() => bundle,
+        _ => {
             warn!(
                 spiffe_id = %spiffe_id,
                 trust_domain = %trust_domain,
@@ -266,6 +270,15 @@ pub fn validate_certificate(
             );
             return Err(ValidationError::UnknownTrustDomain(trust_domain));
         }
+    };
+    if let Err(e) = verify_chain(&cert_der, &intermediates, bundle) {
+        warn!(
+            spiffe_id = %spiffe_id,
+            trust_domain = %trust_domain,
+            error = %e,
+            "Certificate does not chain to the trust bundle"
+        );
+        return Err(e);
     }
 
     // Build certificate info
@@ -293,18 +306,62 @@ pub fn validate_certificate(
     ))
 }
 
-/// Verify a certificate's signature against a CA certificate.
-fn verify_certificate_signature(cert_der: &[u8], ca_der: &[u8]) -> Result<(), ValidationError> {
-    let (_, cert) = X509Certificate::from_der(cert_der)
-        .map_err(|e| ValidationError::ParseFailed(format!("Cert parse failed: {}", e)))?;
+/// Verify that `leaf_der` chains to one of `bundle` (trust anchors), possibly
+/// through `intermediates`, as a TLS client certificate.
+///
+/// Full RFC 5280 path validation by `rustls-webpki`: every signature on the
+/// path, validity periods of every certificate, basic constraints (a CA
+/// certificate is rejected as the leaf, a non-CA is rejected as an issuer),
+/// path length and name constraints, and the client-auth extended key usage
+/// when the leaf carries an EKU extension.
+fn verify_chain(
+    leaf_der: &[u8],
+    intermediates: &[Vec<u8>],
+    bundle: &[Vec<u8>],
+) -> Result<(), ValidationError> {
+    use rustls_pki_types::{CertificateDer, UnixTime};
 
-    let (_, ca) = X509Certificate::from_der(ca_der)
-        .map_err(|e| ValidationError::ParseFailed(format!("CA parse failed: {}", e)))?;
+    let anchor_ders: Vec<CertificateDer<'_>> = bundle
+        .iter()
+        .map(|der| CertificateDer::from(der.as_slice()))
+        .collect();
+    let anchors: Vec<_> = anchor_ders
+        .iter()
+        .filter_map(|der| match webpki::anchor_from_trusted_cert(der) {
+            Ok(anchor) => Some(anchor),
+            Err(e) => {
+                warn!(error = ?e, "Skipping unparsable trust bundle certificate");
+                None
+            }
+        })
+        .collect();
+    if anchors.is_empty() {
+        return Err(ValidationError::ChainVerificationFailed(
+            "trust bundle contains no usable CA certificate".to_string(),
+        ));
+    }
 
-    // Verify the certificate was signed by the CA
-    cert.verify_signature(Some(ca.public_key())).map_err(|e| {
-        ValidationError::ChainVerificationFailed(format!("Signature verification failed: {:?}", e))
-    })
+    let leaf = CertificateDer::from(leaf_der);
+    let end_entity = webpki::EndEntityCert::try_from(&leaf).map_err(|e| {
+        ValidationError::ChainVerificationFailed(format!("leaf certificate rejected: {e:?}"))
+    })?;
+    let intermediates: Vec<CertificateDer<'_>> = intermediates
+        .iter()
+        .map(|der| CertificateDer::from(der.as_slice()))
+        .collect();
+
+    end_entity
+        .verify_for_usage(
+            webpki::ALL_VERIFICATION_ALGS,
+            &anchors,
+            &intermediates,
+            UnixTime::now(),
+            webpki::KeyUsage::client_auth(),
+            None,
+            None,
+        )
+        .map(|_| ())
+        .map_err(|e| ValidationError::ChainVerificationFailed(format!("{e:?}")))
 }
 
 /// Extract additional claims from the certificate.
@@ -370,7 +427,7 @@ aiAiEAtest56789=
     fn test_decode_base64_der() {
         // A minimal DER-encoded certificate (just checking decode works)
         let base64_der = "MIIB"; // Truncated for test
-        let result = decode_certificate(base64_der);
+        let result = decode_certificate_chain(base64_der);
         // Should fail on parse but decode should work
         assert!(result.is_ok() || matches!(result, Err(ValidationError::DecodingFailed(_))));
     }

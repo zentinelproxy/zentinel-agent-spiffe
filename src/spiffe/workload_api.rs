@@ -357,6 +357,42 @@ impl WorkloadApiClient {
         })
     }
 
+    /// Keep the trust bundle cache filled from the SPIRE agent.
+    ///
+    /// Connects (and reconnects) to the Workload API, fetches the X.509
+    /// bundles immediately and then every `refresh_interval_secs`. A failed
+    /// attempt is retried after `retry_secs` and keeps the last good bundles,
+    /// as SPIFFE libraries do. Until the first successful fetch the cache is
+    /// empty, so every forwarded certificate is rejected.
+    pub fn start_bundle_watch(
+        self: Arc<Self>,
+        refresh_interval_secs: u64,
+        retry_secs: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let result = async {
+                    if !self.is_connected().await {
+                        self.connect().await?;
+                    }
+                    self.refresh_bundles().await
+                }
+                .await;
+
+                let wait = match result {
+                    Ok(()) => refresh_interval_secs,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to fetch SPIRE trust bundles");
+                        // Drop the channel so the next attempt reconnects.
+                        *self.grpc_client.write().await = None;
+                        retry_secs
+                    }
+                };
+                tokio::time::sleep(Duration::from_secs(wait.max(1))).await;
+            }
+        })
+    }
+
     /// Validate bundles are available for a trust domain.
     pub async fn has_bundle_for(&self, trust_domain: &str) -> bool {
         self.bundle_cache.get(trust_domain).await.is_some()

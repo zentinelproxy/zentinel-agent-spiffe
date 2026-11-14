@@ -114,6 +114,10 @@ pub struct SpiffeAgent {
     requests_blocked: AtomicU64,
     /// Whether the agent is draining.
     draining: RwLock<bool>,
+    /// Background task keeping `bundle_cache` filled from SPIRE; started the
+    /// first time a configuration reads client certificates. `validate()`
+    /// refuses the only such setting today, so it does not run yet (#5).
+    bundle_watch: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl SpiffeAgent {
@@ -134,7 +138,7 @@ impl SpiffeAgent {
 
         let bundle_cache = workload_client.bundle_cache();
 
-        Ok(Self {
+        let agent = Self {
             config: RwLock::new(config),
             config_version: RwLock::new(None),
             allowlist: RwLock::new(allowlist),
@@ -144,7 +148,35 @@ impl SpiffeAgent {
             requests_allowed: AtomicU64::new(0),
             requests_blocked: AtomicU64::new(0),
             draining: RwLock::new(false),
-        })
+            bundle_watch: std::sync::Mutex::new(None),
+        };
+        let config = agent.config.try_read().map(|c| c.clone());
+        if let Ok(config) = config {
+            agent.ensure_bundle_watch(&config);
+        }
+        Ok(agent)
+    }
+
+    /// Start fetching SPIRE trust bundles if this configuration reads
+    /// forwarded certificates. Without bundles every certificate is rejected.
+    fn ensure_bundle_watch(&self, config: &SpiffeAgentConfig) {
+        if !config.tls.trust_forwarded_client_cert {
+            return;
+        }
+        let Ok(mut watch) = self.bundle_watch.lock() else {
+            return;
+        };
+        if watch.is_some() || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        info!(
+            spire_socket = %self.workload_client.socket_path().display(),
+            "Fetching SPIRE trust bundles to verify forwarded client certificates"
+        );
+        *watch = Some(
+            Arc::clone(&self.workload_client)
+                .start_bundle_watch(config.spire.bundle_refresh_interval, 5),
+        );
     }
 
     /// Reconfigure the agent with new settings.
@@ -157,6 +189,8 @@ impl SpiffeAgent {
 
         // Update allowlist
         *self.allowlist.write().await = new_allowlist;
+
+        self.ensure_bundle_watch(&new_config);
 
         // Update config
         *self.config.write().await = new_config;
@@ -178,11 +212,18 @@ impl SpiffeAgent {
     /// Remove every identity header this agent emits from the upstream
     /// request, so a client cannot supply them itself. Applied to every
     /// response that lets the request through, before any identity is set.
+    ///
+    /// The client certificate header is removed too: its value is whatever
+    /// the client sent, and an upstream that reads it (as Envoy-style
+    /// services read `X-Forwarded-Client-Cert`) must not see it.
     fn strip_identity_headers(
         mut response: AgentResponse,
         config: &SpiffeAgentConfig,
     ) -> AgentResponse {
         for name in config.identity_header_names() {
+            response = response.add_request_header(HeaderOp::Remove { name });
+        }
+        for name in config.client_cert_header_names() {
             response = response.add_request_header(HeaderOp::Remove { name });
         }
         response
@@ -348,11 +389,8 @@ impl AgentHandlerV2 for SpiffeAgent {
         // Store the config version
         *self.config_version.write().await = version.clone();
 
-        // Try to connect to SPIRE agent
-        if let Err(e) = self.workload_client.connect().await {
-            warn!("Failed to connect to SPIRE agent: {}", e);
-            // Don't fail - we can still validate certs without trust bundles
-        }
+        // Trust bundles are fetched by the bundle watch that `reconfigure`
+        // starts when the configuration reads forwarded certificates.
 
         info!(
             config_version = ?version,
@@ -455,8 +493,10 @@ impl AgentHandlerV2 for SpiffeAgent {
 
         // Zentinel does not tell agents which peer certificate it verified, and
         // it never sets the client-certificate header itself, so that header is
-        // client-controlled unless a trusted front proxy sets it. Without the
-        // explicit opt-in there is no verifiable identity source at all.
+        // client-controlled. `validate()` refuses the opt-in, so in a running
+        // agent there is no verifiable identity source at all and every request
+        // takes this branch. The path below (chain validation against the
+        // SPIRE bundle) waits for a verified certificate source (#5).
         if !config.tls.trust_forwarded_client_cert {
             if config.tls.require_mtls {
                 debug!("No verifiable client identity source, mTLS required");
@@ -963,17 +1003,17 @@ mod tests {
     }
 
     #[test]
-    fn test_fixture_is_a_forgery_unverified_parsing_accepts() {
-        // Guards the tests below: without a trust bundle the certificate is
-        // accepted as `spiffe://example.org/frontend` (what the agent did with
-        // every forwarded certificate before), and with an empty bundle it is
-        // rejected.
-        let unverified = validate_certificate(SELF_SIGNED_SPIFFE_CERT_B64, None).unwrap();
-        assert!(unverified.valid);
+    fn test_fixture_is_a_forgery_rejected_without_a_bundle() {
+        // The fixture parses as `spiffe://example.org/frontend`, but with no
+        // bundle (None) or an empty bundle it is never an identity: there is
+        // no parse-only mode any more.
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        let der = BASE64.decode(SELF_SIGNED_SPIFFE_CERT_B64).unwrap();
         assert_eq!(
-            unverified.spiffe_id.as_deref(),
-            Some("spiffe://example.org/frontend")
+            spiffe::extract_spiffe_id_from_cert(&der).unwrap(),
+            "spiffe://example.org/frontend"
         );
+        assert!(validate_certificate(SELF_SIGNED_SPIFFE_CERT_B64, None).is_err());
         assert!(validate_certificate(SELF_SIGNED_SPIFFE_CERT_B64, Some(&HashMap::new())).is_err());
     }
 
@@ -1015,6 +1055,30 @@ mod tests {
         assert!(!cfg.tls.trust_forwarded_client_cert);
         drop(cfg);
         assert!(agent.config_version.read().await.is_none());
+        assert!(
+            agent.bundle_watch.lock().unwrap().is_none(),
+            "a refused configuration must not start the bundle watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bundle_watch_starts_only_for_a_config_that_reads_certificates() {
+        // Groundwork for a verified certificate source (#5): the watch is
+        // started once, and only for a configuration that reads certificates.
+        let agent = SpiffeAgent::new(test_config()).unwrap();
+        agent.ensure_bundle_watch(&test_config());
+        assert!(agent.bundle_watch.lock().unwrap().is_none());
+
+        let mut reads = test_config();
+        reads.tls.trust_forwarded_client_cert = true; // bypasses validate()
+        agent.ensure_bundle_watch(&reads);
+        assert!(agent.bundle_watch.lock().unwrap().is_some());
+        // No SPIRE, so no bundle: a forged certificate is still refused.
+        *agent.config.write().await = reads;
+        agent.config.write().await.tls.require_mtls = true;
+        let response = agent.on_request_headers(spoofed_request()).await;
+        assert_eq!(status(&response), Some(401));
+        assert!(set(&response).is_empty());
     }
 
     #[tokio::test]
@@ -1078,5 +1142,273 @@ mod tests {
         let agent = SpiffeAgent::new(config_from_args(&args)).unwrap();
         let response = agent.on_request_headers(request(&[])).await;
         assert_eq!(status(&response), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Forwarded certificates are path-validated against the SPIRE bundle
+    // (zentinelproxy/zentinel-agent-spiffe#5). Certificates are minted with
+    // rcgen per test: a SPIRE-like root, an optional intermediate, and SVIDs.
+    // ---------------------------------------------------------------------
+
+    struct Ca {
+        params: rcgen::CertificateParams,
+        key: rcgen::KeyPair,
+        der: Vec<u8>,
+        pem: String,
+    }
+
+    fn ca_params(cn: &str) -> rcgen::CertificateParams {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+    }
+
+    fn root_ca(cn: &str) -> Ca {
+        let params = ca_params(cn);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        Ca {
+            der: cert.der().to_vec(),
+            pem: cert.pem(),
+            params,
+            key,
+        }
+    }
+
+    fn intermediate_ca(cn: &str, issuer: &Ca) -> Ca {
+        let params = ca_params(cn);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let signer = rcgen::Issuer::from_params(&issuer.params, &issuer.key);
+        let cert = params.signed_by(&key, &signer).unwrap();
+        Ca {
+            der: cert.der().to_vec(),
+            pem: cert.pem(),
+            params,
+            key,
+        }
+    }
+
+    enum Kind {
+        /// A normal X.509-SVID: not a CA, client+server auth EKU.
+        Svid,
+        /// A CA certificate carrying a SPIFFE ID.
+        CaCert,
+        /// An end-entity certificate only usable as a TLS server.
+        ServerOnly,
+    }
+
+    /// Mint a certificate for `uris` signed by `issuer`, as PEM.
+    fn mint(uris: &[&str], issuer: &Ca, kind: Kind) -> String {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "workload");
+        params.subject_alt_names = uris
+            .iter()
+            .map(|u| rcgen::SanType::URI((*u).try_into().unwrap()))
+            .collect();
+        match kind {
+            Kind::Svid => {
+                params.is_ca = rcgen::IsCa::ExplicitNoCa;
+                params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+                params.extended_key_usages = vec![
+                    rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+                    rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+                ];
+            }
+            Kind::CaCert => {
+                params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+                params.key_usages = vec![
+                    rcgen::KeyUsagePurpose::KeyCertSign,
+                    rcgen::KeyUsagePurpose::DigitalSignature,
+                ];
+            }
+            Kind::ServerOnly => {
+                params.is_ca = rcgen::IsCa::ExplicitNoCa;
+                params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+                params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+            }
+        }
+        let key = rcgen::KeyPair::generate().unwrap();
+        let signer = rcgen::Issuer::from_params(&issuer.params, &issuer.key);
+        params.signed_by(&key, &signer).unwrap().pem()
+    }
+
+    /// The header value a front proxy would forward (URL-encoded PEM).
+    fn xfcc(pems: &[&str]) -> String {
+        urlencoding::encode(&pems.concat()).into_owned()
+    }
+
+    /// An agent that reads the forwarded header (bypassing `validate()`, which
+    /// refuses that), with `bundles` loaded as if fetched from SPIRE. It
+    /// exercises the chain validation a verified certificate source will use.
+    async fn opt_in_agent(bundles: &[(&str, &Ca)]) -> SpiffeAgent {
+        let agent = SpiffeAgent::new(test_config()).unwrap();
+        agent.config.write().await.tls.trust_forwarded_client_cert = true;
+        let mut map: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        for (domain, ca) in bundles {
+            map.entry(domain.to_string())
+                .or_default()
+                .push(ca.der.clone());
+        }
+        agent.bundle_cache.update(map).await;
+        agent
+    }
+
+    fn spiffe_id_set(response: &AgentResponse) -> Option<String> {
+        response.request_headers.iter().find_map(|op| match op {
+            HeaderOp::Set { name, value } if name.eq_ignore_ascii_case("x-spiffe-id") => {
+                Some(value.clone())
+            }
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_forwarded_svid_signed_by_bundle_ca_authenticates() {
+        let root = root_ca("spire root");
+        let agent = opt_in_agent(&[("example.org", &root)]).await;
+        let leaf = mint(&["spiffe://example.org/frontend"], &root, Kind::Svid);
+
+        let response = agent
+            .on_request_headers(request(&[("X-Forwarded-Client-Cert", &xfcc(&[&leaf]))]))
+            .await;
+        assert_eq!(status(&response), None);
+        assert_eq!(
+            spiffe_id_set(&response).as_deref(),
+            Some("spiffe://example.org/frontend")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forwarded_svid_issued_by_intermediate_authenticates() {
+        // SPIRE with an upstream authority (or a nested SPIRE server) issues
+        // SVIDs from an intermediate; the front proxy forwards leaf + chain.
+        let root = root_ca("spire root");
+        let intermediate = intermediate_ca("spire intermediate", &root);
+        let agent = opt_in_agent(&[("example.org", &root)]).await;
+        let leaf = mint(
+            &["spiffe://example.org/frontend"],
+            &intermediate,
+            Kind::Svid,
+        );
+
+        let response = agent
+            .on_request_headers(request(&[(
+                "X-Forwarded-Client-Cert",
+                &xfcc(&[&leaf, &intermediate.pem]),
+            )]))
+            .await;
+        assert_eq!(status(&response), None, "{:?}", response.audit);
+        assert_eq!(
+            spiffe_id_set(&response).as_deref(),
+            Some("spiffe://example.org/frontend")
+        );
+
+        // Without the intermediate there is no path to the root.
+        let response = agent
+            .on_request_headers(request(&[("X-Forwarded-Client-Cert", &xfcc(&[&leaf]))]))
+            .await;
+        assert_eq!(status(&response), Some(401));
+        assert!(spiffe_id_set(&response).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_forwarded_cert_from_another_ca_is_rejected() {
+        let root = root_ca("spire root");
+        let attacker = root_ca("attacker root");
+        let agent = opt_in_agent(&[("example.org", &root), ("evil.org", &attacker)]).await;
+
+        // An attacker-issued certificate claiming example.org, and the
+        // attacker's own trust domain's bundle cannot vouch for example.org.
+        let forged = mint(&["spiffe://example.org/frontend"], &attacker, Kind::Svid);
+        // The self-signed fixture, too.
+        for header in [xfcc(&[&forged]), SELF_SIGNED_SPIFFE_CERT_B64.to_string()] {
+            let response = agent
+                .on_request_headers(request(&[("X-Forwarded-Client-Cert", &header)]))
+                .await;
+            assert_eq!(status(&response), Some(401));
+            assert!(spiffe_id_set(&response).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_forwarded_ca_certificate_is_not_an_identity() {
+        // A CA certificate issued under the bundle is not an X.509-SVID: a
+        // leaf must not be a CA. A single signature check accepted it.
+        let root = root_ca("spire root");
+        let agent = opt_in_agent(&[("example.org", &root)]).await;
+        let ca_cert = mint(&["spiffe://example.org/frontend"], &root, Kind::CaCert);
+
+        let response = agent
+            .on_request_headers(request(&[("X-Forwarded-Client-Cert", &xfcc(&[&ca_cert]))]))
+            .await;
+        assert_eq!(status(&response), Some(401));
+        assert!(spiffe_id_set(&response).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_forwarded_server_only_certificate_is_not_a_client_identity() {
+        let root = root_ca("spire root");
+        let agent = opt_in_agent(&[("example.org", &root)]).await;
+        let server_only = mint(&["spiffe://example.org/frontend"], &root, Kind::ServerOnly);
+
+        let response = agent
+            .on_request_headers(request(&[(
+                "X-Forwarded-Client-Cert",
+                &xfcc(&[&server_only]),
+            )]))
+            .await;
+        assert_eq!(status(&response), Some(401));
+        assert!(spiffe_id_set(&response).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_certificate_with_two_uri_sans_is_not_an_svid() {
+        // An X.509-SVID has exactly one URI SAN. Which of two is "the"
+        // identity is ambiguous, so reject instead of picking the first.
+        let root = root_ca("spire root");
+        let agent = opt_in_agent(&[("example.org", &root)]).await;
+        let two = mint(
+            &[
+                "spiffe://example.org/frontend",
+                "spiffe://example.org/admin",
+            ],
+            &root,
+            Kind::Svid,
+        );
+
+        let response = agent
+            .on_request_headers(request(&[("X-Forwarded-Client-Cert", &xfcc(&[&two]))]))
+            .await;
+        assert_eq!(status(&response), Some(401));
+        assert!(spiffe_id_set(&response).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_untrusted_client_cert_header_is_removed_upstream() {
+        // Default config: the header is client-controlled, so it must not
+        // reach an upstream that might read it as the client's certificate.
+        let agent = SpiffeAgent::new(test_config()).unwrap();
+        let response = agent.on_request_headers(spoofed_request()).await;
+        assert_eq!(status(&response), None);
+        assert!(removed(&response).contains(&"x-forwarded-client-cert".to_string()));
+
+        // A custom header name: both it and the default name are removed.
+        let mut config = test_config();
+        config.tls.client_cert_header = "X-Client-Cert".to_string();
+        let agent = SpiffeAgent::new(config).unwrap();
+        let response = agent.on_request_headers(spoofed_request()).await;
+        let removed = removed(&response);
+        assert!(removed.contains(&"x-client-cert".to_string()));
+        assert!(removed.contains(&"x-forwarded-client-cert".to_string()));
     }
 }

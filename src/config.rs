@@ -37,15 +37,32 @@ impl SpiffeAgentConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.tls.trust_forwarded_client_cert {
             return Err(format!(
-                "tls.trust-forwarded-client-cert is set, but this agent cannot verify a \
-                 forwarded client certificate against the SPIRE trust bundle (trust bundles \
-                 are never fetched and only a single signature is checked), so `{}` would be \
-                 client-controlled identity; refusing the configuration \
+                "tls.trust-forwarded-client-cert is set, but Zentinel does not tell agents \
+                 which client certificate it verified and does not set `{}` itself, so that \
+                 header is client-controlled: a forged certificate fails path validation \
+                 against the SPIRE trust bundle, but a copy of any real workload's \
+                 certificate (which is not a secret) would pass; refusing the configuration \
                  (zentinelproxy/zentinel-agent-spiffe#5)",
                 self.tls.client_cert_header
             ));
         }
         Ok(())
+    }
+
+    /// Client certificate header names the agent removes from the upstream
+    /// request: the configured header and the default
+    /// `X-Forwarded-Client-Cert`, deduplicated case-insensitively. Their
+    /// value is whatever the client sent, so an upstream that reads them (as
+    /// Envoy-style services read `X-Forwarded-Client-Cert`) must not see it.
+    pub fn client_cert_header_names(&self) -> Vec<String> {
+        let default = default_client_cert_header();
+        let configured = self.tls.client_cert_header.trim();
+        let mut names = Vec::new();
+        if !configured.is_empty() && !configured.eq_ignore_ascii_case(&default) {
+            names.push(configured.to_string());
+        }
+        names.push(default);
+        names
     }
 
     /// Names of every identity header this agent emits, plus the default
@@ -138,14 +155,15 @@ pub struct TlsConfig {
     #[serde(default)]
     pub require_mtls: bool,
 
-    /// Treat `client-cert-header` as the client's identity.
+    /// Treat `client-cert-header` as the client's certificate.
     ///
     /// Zentinel does not set that header, so unless a trusted TLS-terminating
     /// proxy in front of Zentinel sets it (and strips any client-supplied
-    /// copy), its value is chosen by the client. Defaults to `false`. Opting in
-    /// also requires verifying the certificate chain against the SPIRE trust
-    /// bundle, which this agent does not implement yet, so a configuration
-    /// that sets this to `true` is rejected (see
+    /// copy), its value is chosen by the client. Defaults to `false`: the
+    /// header is then never read, and it is removed from the upstream request.
+    ///
+    /// A configuration that sets this to `true` is rejected: the agent cannot
+    /// tell a certificate the proxy verified from one the client sent (see
     /// zentinelproxy/zentinel-agent-spiffe#5).
     #[serde(default)]
     pub trust_forwarded_client_cert: bool,

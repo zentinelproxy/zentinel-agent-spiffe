@@ -36,6 +36,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # X.509 certificate parsing
 x509-parser = { version = "0.16", features = ["verify"] }
 rustls-pemfile = "2"
+# Certificate path validation against the SPIRE trust bundle
+rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
+rustls-pki-types = "1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -69,5 +72,6 @@ http = "1.1"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
+rcgen = "0.14"
 tempfile = "3.12"
 tokio-test = "0.4"
